@@ -3047,6 +3047,72 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
     assert tokens.get("refresh_token") == "old-refresh-token"
 
 
+def test_manual_codex_refresh_resyncs_rotated_token_under_lock(tmp_path, monkeypatch):
+    """Two stale pool instances must not reuse one manual refresh token."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "gptprof:profile1",
+                        "label": "profile1",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "access-0",
+                        "refresh_token": "refresh-0",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    import hermes_cli.auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    first_pool = load_pool("openai-codex")
+    second_pool = load_pool("openai-codex")
+    first_entry = first_pool.entries()[0]
+    second_entry = second_pool.entries()[0]
+    consumed: set[str] = set()
+    refresh_inputs: list[str] = []
+
+    def _rotate(_access_token, refresh_token):
+        refresh_inputs.append(refresh_token)
+        if refresh_token in consumed:
+            raise AuthError(
+                "Refresh token reused",
+                provider="openai-codex",
+                code="refresh_token_reused",
+                relogin_required=True,
+            )
+        consumed.add(refresh_token)
+        generation = len(consumed)
+        return {
+            "access_token": f"access-{generation}",
+            "refresh_token": f"refresh-{generation}",
+            "last_refresh": f"generation-{generation}",
+        }
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _rotate)
+
+    first_refreshed = first_pool._refresh_entry(first_entry, force=True)
+    second_refreshed = second_pool._refresh_entry(second_entry, force=True)
+
+    assert first_refreshed is not None
+    assert second_refreshed is not None
+    assert refresh_inputs == ["refresh-0", "refresh-1"]
+    persisted = auth_mod.read_credential_pool("openai-codex")
+    assert persisted[0]["refresh_token"] == "refresh-2"
+    assert persisted[0]["last_status"] == "ok"
+
+
 def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
     """Regression for #19566: stale rotation writes keep concurrent entries."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

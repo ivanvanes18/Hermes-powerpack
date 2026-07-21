@@ -10,7 +10,7 @@
 
 ### Зачем этот скилл
 
-`gptprof-hermes` — Hermes-нативная обёртка вокруг [gptprof-public](https://github.com/evgyur/gptprof-public) (codex-profile-manager.py). Показывает карточку профиля с **inline-кнопками**, где на каждой кнопке — остаток % по 5-часовому и недельному окну.
+`gptprof-hermes` — Hermes-нативная карточка профилей на базе идей [gptprof-public](https://github.com/evgyur/gptprof-public). Токены после импорта принадлежат штатному `CredentialPool` Hermes.
 
 ### Возможности
 
@@ -28,14 +28,10 @@
 git clone https://github.com/evgyur/gptprof-hermes.git ~/gptprof-hermes
 
 # 2. Скопировать бинарники
-cp bin/codex-profile-manager.py ~/.local/bin/codex-profile-manager.py
-cp bin/send_buttons.py         ~/.local/bin/send_buttons.py
-cp bin/refresh_profiles.py     ~/.local/bin/refresh_profiles.py
-cp bin/gptprof_autoswitch.py   ~/.local/bin/gptprof_autoswitch.py
-chmod 700 ~/.local/bin/codex-profile-manager.py
-chmod 700 ~/.local/bin/send_buttons.py
-chmod 700 ~/.local/bin/refresh_profiles.py
-chmod 700 ~/.local/bin/gptprof_autoswitch.py
+install -m 700 bin/send_buttons.py       ~/.local/bin/send_buttons.py
+install -m 700 bin/send_buttons.py       ~/.local/bin/gptprof_send_buttons.py
+install -m 700 bin/refresh_profiles.py   ~/.local/bin/gptprof_refresh_profiles.py
+install -m 700 bin/gptprof_autoswitch.py ~/.local/bin/gptprof_autoswitch.py
 
 # 3. Добавить quick_commands в config.yaml (см. ниже)
 
@@ -80,20 +76,19 @@ quick_commands:
 
 **Это происходит на уровне Hermes gateway**, а не в `send_buttons.py`.
 
-При нажатии кнопки `gptprof:<slug>:<model>` Hermes gateway (`gateway/platforms/telegram.py`) выполняет:
+При нажатии кнопки `gptprof:<slug>:<model>` Telegram adapter Hermes (`plugins/platforms/telegram/adapter.py`) выполняет:
 
-1. Копирует `access_token` + `refresh_token` из `~/.hermes/gptprof/profiles/<slug>.json` в `auth.json → codex`
+1. Импортирует или выбирает `gptprof:<slug>` в `credential_pool.openai-codex` с источником `manual:device_code`; уже существующая запись пула имеет приоритет над bootstrap-файлом
 2. **Пишет глобальный config**: `model=<model>`, `provider=openai-codex` в `config.yaml` — эквивалент `/model <model> --provider openai-codex --global`
-3. Устанавливает session override на уровне gateway
-4. evict cached agent → рекомендует `/new` для новой сессии
+3. Рекомендует `/new`, чтобы новая сессия разрешила сохранённый маршрут и профиль вместе
 
 Таким образом после нажатия кнопки профиля:
 - Gateway restart **не сбросит** модель обратно (config.yaml записан)
-- Сессия начинает использовать новый профиль сразу
+- Новая сессия использует выбранные маршрут и профиль после `/new`
 
 ### Настройка профилей
 
-Скилл работает с **локальным пулом профилей** в `$HERMES_HCP`:
+Скилл использует bootstrap-каталог профилей в `$HERMES_HCP`:
 
 ```
 ~/.hermes/gptprof/profiles/
@@ -102,7 +97,7 @@ quick_commands:
 └── profile3.json
 ```
 
-Каждый JSON содержит OAuth-токен профиля:
+При первом импорте каждый JSON содержит OAuth-пару профиля:
 
 ```json
 {
@@ -113,20 +108,19 @@ quick_commands:
 }
 ```
 
-Активный профиль определяется по `auth.json`:
+После импорта актуальные токены и refresh-state хранятся только в штатном CredentialPool. В `gptprof.imported_profiles` сохраняется история несекретных отпечатков bootstrap refresh token: удаление записи пула или откат файла не может повторно импортировать любую уже израсходованную цепочку. Новая авторизация принимается, только если такой refresh token ещё не импортировался. Auth и config всегда читаются из канонического `$HERMES_HOME`. Активный профиль определяется по `auth.json`:
 
 ```json
 {
-  "codex": {
-    "profile": "profile3",
-    "access_token": "<ACTIVE_TOKEN>"
+  "gptprof": {
+    "active_profile": "profile3"
   }
 }
 ```
 
 ### Локальное обновление OAuth-токенов
 
-`send_buttons.py` сам обновляет access token, если он истекает в ближайшие 48 часов. Для независимости от OpenClaw поставьте локальный timer:
+`send_buttons.py` не обновляет OAuth-токены. Единственный владелец rotation lifecycle — штатный CredentialPool Hermes; timer только вызывает его:
 
 ```ini
 # /etc/systemd/system/gptprof-token-refresh.service
@@ -140,8 +134,7 @@ Type=oneshot
 User=hermes
 WorkingDirectory=/home/hermes/gptprof-hermes
 Environment=GPTPROF_INTEL64_OPENCLAW_SYNC=0
-Environment=GPTPROF_ACCESS_REFRESH_SKEW=172800
-ExecStart=/opt/hermes-agent/venv/bin/python3 /home/hermes/gptprof-hermes/bin/refresh_profiles.py
+ExecStart=<venv-python> <runtime-home>/.local/bin/gptprof_refresh_profiles.py
 ```
 
 ```ini
@@ -166,14 +159,16 @@ sudo systemctl enable --now gptprof-token-refresh.timer
 sudo systemctl start gptprof-token-refresh.service
 ```
 
-`GPTPROF_INTEL64_OPENCLAW_SYNC=1` оставлен только как break-glass импорт, если локальная копия уже протухла. Нормальный путь — локальный `refresh_profiles.py` + systemd timer.
+`GPTPROF_INTEL64_OPENCLAW_SYNC=1` оставлен только как одноразовый break-glass импорт. Не держите два активных refresher-процесса на одной single-use цепочке.
+
+Refresh-lock хранится в `$HERMES_HOME/run/gptprof-token-refresh.lock`; autoswitch-lock и state — в `$HERMES_HOME/run/gptprof-autoswitch.lock` и `$HERMES_HOME/gptprof/autoswitch-state.json`. Lock-файлы не следуют по симлинкам, state записывается атомарно.
 
 ### Autoswitch (автопереключение)
 
-`codex-profile-manager.py` умеет автоматически переключать профиль, если активный достиг 95% по любому окну:
+Штатный helper автоматически переключает профиль, если остаток активного достиг 5% по любому окну:
 
 ```bash
-python3 ~/.local/bin/codex-profile-manager.py autoswitch
+python3 ~/.local/bin/gptprof_autoswitch.py
 ```
 
 Логика: если `active.5h_used >= 95%` ИЛИ `active.weekly_used >= 95%`, и есть простой кандидат с остатком >5% по обоим окнам — переезжаем на него.
@@ -194,18 +189,16 @@ bash tests/smoke.sh
 
 ### What This Is
 
-`gptprof-hermes` is a public Hermes skill wrapping [gptprof-public](https://github.com/evgyur/gptprof-public). It shows a Telegram profile card with inline buttons displaying **remaining %** per profile for the 5-hour and weekly windows.
+`gptprof-hermes` is a public Hermes profile card based on ideas from [gptprof-public](https://github.com/evgyur/gptprof-public). After bootstrap import, Hermes CredentialPool owns runtime tokens and refresh rotation.
 
 ### Quick Start
 
 ```bash
 git clone https://github.com/evgyur/gptprof-hermes.git ~/gptprof-hermes
-cp bin/codex-profile-manager.py ~/.local/bin/
-cp bin/send_buttons.py         ~/.local/bin/
-cp bin/refresh_profiles.py     ~/.local/bin/
-chmod 700 ~/.local/bin/codex-profile-manager.py
-chmod 700 ~/.local/bin/send_buttons.py
-chmod 700 ~/.local/bin/refresh_profiles.py
+install -m 700 bin/send_buttons.py       ~/.local/bin/send_buttons.py
+install -m 700 bin/send_buttons.py       ~/.local/bin/gptprof_send_buttons.py
+install -m 700 bin/refresh_profiles.py   ~/.local/bin/gptprof_refresh_profiles.py
+install -m 700 bin/gptprof_autoswitch.py ~/.local/bin/gptprof_autoswitch.py
 ```
 
 Add to `config.yaml` → `quick_commands`:
@@ -227,12 +220,11 @@ Then `/restart` the gateway to pick up new commands.
 
 ### Callback Behavior
 
-Button presses (`gptprof:<slug>:<model>`) are handled by Hermes gateway (`gateway/platforms/telegram.py`). On callback:
+Button presses (`gptprof:<slug>:<model>`) are handled by the Hermes Telegram adapter (`plugins/platforms/telegram/adapter.py`). On callback:
 
-1. Copies OAuth tokens from `~/.hermes/gptprof/profiles/<slug>.json` → `auth.json → codex`
+1. Imports or selects the owned `gptprof:<slug>` entry in `credential_pool.openai-codex`; existing pool tokens take precedence, and an already-consumed bootstrap chain is rejected until re-authentication changes its refresh token
 2. **Writes global config**: `model=<model>`, `provider=openai-codex` to `config.yaml` (equivalent to `/model <model> --provider openai-codex --global`)
-3. Sets session override at gateway level
-4. Evicts cached agent → recommends `/new`
+3. Recommends `/new` so the next session uses the persisted route
 
 This means after pressing a profile button, gateway restarts do **not** reset the model back — the change persists in `config.yaml`.
 
@@ -256,9 +248,9 @@ Fetched from `https://chatgpt.com/backend-api/wham/usage` with 15-minute local c
 ```
 gptprof-hermes/
 ├── bin/
-│   ├── codex-profile-manager.py   # upstream profile manager CLI
-│   ├── refresh_profiles.py        # local OAuth refresh timer target
-│   └── send_buttons.py            # Hermes-native card sender (sends card only)
+│   ├── refresh_profiles.py        # delegates OAuth rotation to CredentialPool
+│   ├── gptprof_autoswitch.py      # quota-based pool selection
+│   └── send_buttons.py            # Hermes-native card sender
 ├── plugin/
 │   ├── index.js                   # OpenClaw plugin bridge (stub)
 │   ├── openclaw.plugin.json        # Plugin manifest
@@ -282,7 +274,5 @@ gptprof-hermes/
 | `/gptprof` | Показать карточку с кнопками и остатком % |
 | `/gptt` | Перейти на gpt-5.5 (Codex route), persistent |
 | `/mmfast` | Вернуться на MiniMax-M2.7, persistent |
-| `codex-profile-manager.py status` | CLI: показать статус всех профилей |
-| `codex-profile-manager.py autoswitch` | CLI: автопереключение при исчерпании |
-| `codex-profile-manager.py switch <slug>` | CLI: переключить на профиль |
-| `codex-profile-manager.py refresh` | CLI: обновить cache usage |
+| `gptprof_refresh_profiles.py` | CLI: делегировать refresh штатному CredentialPool |
+| `gptprof_autoswitch.py` | CLI: автопереключение при исчерпании |

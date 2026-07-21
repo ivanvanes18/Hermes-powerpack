@@ -714,6 +714,41 @@ class CredentialPool:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
         return entry
 
+    def _sync_manual_entry_from_pool_store(
+        self, entry: PooledCredential
+    ) -> Optional[PooledCredential]:
+        """Re-read an owned manual entry by id while holding the auth lock.
+
+        OAuth refresh tokens are single-use. Two processes can load the same
+        manual pool entry before either refreshes it; the process that acquires
+        the shared auth lock second must adopt the first process's rotated pair
+        from disk instead of replaying its stale in-memory refresh token.
+        """
+        if not _is_manual_source(entry.source):
+            return entry
+        try:
+            persisted_entries = read_credential_pool(self.provider)
+            persisted = next(
+                (
+                    item
+                    for item in persisted_entries
+                    if isinstance(item, dict) and item.get("id") == entry.id
+                ),
+                None,
+            )
+            if persisted is None:
+                logger.debug(
+                    "Pool entry %s disappeared before refresh; refusing stale resurrection",
+                    entry.id,
+                )
+                return None
+            synced = PooledCredential.from_dict(self.provider, persisted)
+            self._replace_entry(entry, synced)
+            return synced
+        except Exception as exc:
+            logger.debug("Failed to sync manual pool entry %s: %s", entry.id, exc)
+            return None
+
     def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync an xAI OAuth pool entry from auth.json if tokens differ.
 
@@ -982,7 +1017,12 @@ class CredentialPool:
                 float(refresh_timeout_seconds) + 5.0,
             )
             with _auth_store_lock(timeout_seconds=lock_timeout):
-                synced = self._sync_codex_entry_from_auth_store(entry)
+                if _is_manual_source(entry.source):
+                    synced = self._sync_manual_entry_from_pool_store(entry)
+                    if synced is None:
+                        return None
+                else:
+                    synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
                     if not force and not self._entry_needs_refresh(entry):
@@ -2105,8 +2145,20 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # changes to the .env file.
     def _get_env_prefer_dotenv(key: str) -> str:
         env_file = load_env()
-        val = env_file.get(key) or _get_secret(key, "") or ""
-        return val.strip()
+        raw = env_file.get(key, "").strip()
+        env_val = os.environ.get(key, "").strip()
+        # If .env contains an unresolved op:// reference, prefer the
+        # already-resolved value from os.environ (set by
+        # load_hermes_dotenv() -> apply_onepassword_secrets()).  The raw
+        # "op://Vault/Item/field" string would otherwise win and every
+        # provider auth attempt would receive a URL instead of a key.  This
+        # happens during a partial migration, or when the user wrote op://
+        # references straight into .env rather than the secrets.onepassword
+        # config block.  For every non-op:// value the original
+        # .env-takes-precedence behaviour is preserved unchanged.
+        if raw.startswith("op://") and env_val:
+            return env_val
+        return raw or _get_secret(key, "") or env_val
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it

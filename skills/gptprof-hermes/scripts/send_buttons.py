@@ -10,10 +10,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as dt
+import hashlib
 import json
 import os
 import subprocess
+import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -46,21 +50,22 @@ def _env_or_file(key: str, default: str = "") -> str:
 
 TOKEN = _env_or_file("TELEGRAM_BOT_TOKEN")
 TARGET_CHAT_ID = _env_or_file("GPTPROF_CHAT_ID")  # e.g. "123456789"
-AUTH_PATH = os.getenv("HERMES_AUTH", os.path.join(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")), "auth.json"))
-CONFIG_PATH = os.getenv("HERMES_CONFIG", os.path.join(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")), "config.yaml"))
-HCP_DIR = os.path.expanduser(os.getenv("HERMES_HCP", os.path.join(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")), "gptprof", "profiles")))
+HERMES_HOME = os.path.expanduser(os.getenv("HERMES_HOME", "~/.hermes"))
+AUTH_PATH = os.path.join(HERMES_HOME, "auth.json")
+CONFIG_PATH = os.path.join(HERMES_HOME, "config.yaml")
+HCP_DIR = os.path.expanduser(
+    os.getenv("HERMES_HCP", os.path.join(HERMES_HOME, "gptprof", "profiles"))
+)
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 USAGE_TIMEOUT = 8
 CACHE_MAX_AGE = 15 * 60
 CACHE_PATH = "/tmp/gptprof_usage_cache.json"
-CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 ACCESS_REFRESH_SKEW = int(os.getenv("GPTPROF_ACCESS_REFRESH_SKEW", str(48 * 60 * 60)))
-FORCE_REFRESH = os.getenv("GPTPROF_FORCE_REFRESH", "0") == "1"
 # Optional external OpenClaw import is a break-glass path, not the primary refresh path.
 INTEL64_OPENCLAW_SYNC = os.getenv("GPTPROF_INTEL64_OPENCLAW_SYNC", "0") == "1"
 INTEL64_SSH_TARGET = os.getenv("GPTPROF_INTEL64_SSH_TARGET", "")
 INTEL64_OPENCLAW_PROFILES = os.getenv("GPTPROF_INTEL64_OPENCLAW_PROFILES", "~/.openclaw/codex-profiles")
+AUTH_LOCK_HOLDER = threading.local()
 
 PROFILES = [
     ("profile1", "Pro", "gpt-5.5"),
@@ -93,12 +98,22 @@ def load_json(path: str, default: Any) -> Any:
 
 
 def save_json(path: str, data: Any) -> None:
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with temp.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.write("\n")
-    except Exception:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def load_cache() -> dict[str, Any]:
@@ -181,75 +196,261 @@ def normalize_plan(plan: str) -> str:
     return PLAN_LABELS.get(plan.strip().lower(), plan)
 
 
+def _pool_entry_slug(item: dict[str, Any]) -> str | None:
+    entry_id = str(item.get("id") or "")
+    if entry_id.startswith("gptprof:"):
+        return entry_id.split(":", 1)[1] or None
+    profile = item.get("profile")
+    if item.get("source") == "manual:device_code" and isinstance(profile, str):
+        return profile.strip() or None
+    return None
+
+
+def _refresh_fingerprint(value: Any) -> str | None:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def _refresh_fingerprint_history(import_record: Any) -> list[str]:
+    if not isinstance(import_record, dict):
+        return []
+    fingerprints: list[str] = []
+    history = import_record.get("refresh_fingerprints")
+    if isinstance(history, list):
+        fingerprints.extend(
+            str(item) for item in history if isinstance(item, str) and item
+        )
+    legacy = import_record.get("refresh_fingerprint")
+    if isinstance(legacy, str) and legacy:
+        fingerprints.append(legacy)
+    return list(dict.fromkeys(fingerprints))
+
+
+def overlay_runtime_profiles(
+    profiles: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Overlay pool-owned runtime tokens onto the bootstrap profile catalog."""
+    from hermes_cli import auth as auth_mod
+
+    merged = {
+        slug: dict(profile)
+        for slug, profile in profiles.items()
+        if isinstance(profile, dict)
+    }
+    auth_path = Path(AUTH_PATH).expanduser()
+    with auth_mod._file_lock(
+        auth_path.with_suffix(".lock"),
+        AUTH_LOCK_HOLDER,
+        auth_mod.AUTH_LOCK_TIMEOUT_SECONDS,
+        "Timed out waiting for gptprof auth store lock",
+    ):
+        auth = auth_mod._load_auth_store(auth_path)
+
+    pool_root = auth.get("credential_pool") if isinstance(auth, dict) else None
+    pool = pool_root.get("openai-codex") if isinstance(pool_root, dict) else None
+    if not isinstance(pool, list):
+        return merged
+
+    for item in pool:
+        if not isinstance(item, dict) or item.get("source") != "manual:device_code":
+            continue
+        slug = _pool_entry_slug(item)
+        if not slug:
+            continue
+        profile = merged.setdefault(slug, {})
+        for key in (
+            "access_token",
+            "refresh_token",
+            "email",
+            "plan",
+            "last_refresh",
+        ):
+            if item.get(key) not in (None, ""):
+                profile[key] = item[key]
+        status = str(item.get("last_status") or "").strip().lower()
+        if status in {"dead", "exhausted"}:
+            profile["_refresh_error"] = (
+                item.get("last_error_reason")
+                or item.get("last_error_message")
+                or status
+            )
+        else:
+            profile.pop("_refresh_error", None)
+    return merged
+
+
 def get_current_profile() -> str | None:
     auth = load_json(AUTH_PATH, {})
     if isinstance(auth, dict):
+        gptprof = auth.get("gptprof")
+        if isinstance(gptprof, dict):
+            active = gptprof.get("active_profile")
+            if isinstance(active, str) and active.strip():
+                return active.strip()
+
+        pool_root = auth.get("credential_pool")
+        pool = pool_root.get("openai-codex") if isinstance(pool_root, dict) else None
+        if isinstance(pool, list):
+            candidates = [
+                item
+                for item in pool
+                if isinstance(item, dict)
+                and item.get("source") == "manual:device_code"
+                and _pool_entry_slug(item)
+            ]
+            if candidates:
+                selected = min(candidates, key=lambda item: int(item.get("priority") or 0))
+                return _pool_entry_slug(selected)
+
         codex = auth.get("codex") or {}
         if isinstance(codex, dict):
-            return codex.get("profile")
+            active = codex.get("profile")
+            if isinstance(active, str) and active.strip():
+                return active.strip()
     return None
 
 
 def sync_active_auth(slug: str, profile: dict[str, Any]) -> None:
-    """Keep Hermes runtime auth in sync when the active gptprof token rotates."""
-    auth = load_json(AUTH_PATH, {})
-    if not isinstance(auth, dict):
-        return
+    """Import/select one profile while keeping CredentialPool canonical."""
+    from hermes_cli import auth as auth_mod
+    from agent.credential_pool import load_pool
 
-    codex = auth.get("codex")
-    active_slug = codex.get("profile") if isinstance(codex, dict) else None
-    if isinstance(codex, dict) and active_slug == slug:
-        codex["access_token"] = profile.get("access_token")
-        codex["refresh_token"] = profile.get("refresh_token")
-        codex["plan"] = profile.get("plan") or codex.get("plan")
-        codex["email"] = profile.get("email") or codex.get("email")
+    auth_path = Path(AUTH_PATH).expanduser()
+    bootstrap = load_json(os.path.join(HCP_DIR, f"{slug}.json"), {})
+    if not isinstance(bootstrap, dict):
+        bootstrap = {}
+    bootstrap_tokens = bootstrap if bootstrap.get("refresh_token") else profile
+    bootstrap_fingerprint = _refresh_fingerprint(bootstrap_tokens.get("refresh_token"))
 
-        providers = auth.setdefault("providers", {})
-        provider_state = providers.setdefault("openai-codex", {})
-        provider_tokens = dict(provider_state.get("tokens") or {})
-        provider_tokens.update({
-            "profile": slug,
-            "email": profile.get("email"),
-            "plan": profile.get("plan"),
-            "access_token": profile.get("access_token"),
-            "refresh_token": profile.get("refresh_token"),
-        })
-        provider_state["tokens"] = provider_tokens
-        provider_state["auth_mode"] = "chatgpt"
-        provider_state.pop("last_auth_error", None)
-        auth["active_provider"] = "openai-codex"
+    # Clear expired cooldowns through the same availability semantics used by
+    # runtime selection, without triggering network refresh.
+    pool_view = load_pool("openai-codex")
+    pool_view._available_entries(clear_expired=True, refresh=False)
 
-    pool_root = auth.setdefault("credential_pool", {})
-    pool = pool_root.get("openai-codex")
-    if isinstance(pool, list):
-        source = f"gptprof:{slug}"
-        selected_entry = {
-            "source": source,
-            "profile": slug,
-            "label": slug,
-            "provider": "openai-codex",
-            "email": profile.get("email"),
-            "plan": profile.get("plan"),
-            "access_token": profile.get("access_token"),
-            "refresh_token": profile.get("refresh_token"),
-            "priority": 0,
-            "last_status": "ok",
-            "last_status_at": time.time(),
-        }
+    with auth_mod._file_lock(
+        auth_path.with_suffix(".lock"),
+        AUTH_LOCK_HOLDER,
+        auth_mod.AUTH_LOCK_TIMEOUT_SECONDS,
+        "Timed out waiting for gptprof auth store lock",
+    ):
+        auth = auth_mod._load_auth_store(auth_path)
+        if not isinstance(auth, dict):
+            auth = {}
+
+        gptprof = auth.setdefault("gptprof", {})
+        if not isinstance(gptprof, dict):
+            gptprof = {}
+            auth["gptprof"] = gptprof
+        imported_profiles = gptprof.setdefault("imported_profiles", {})
+        if not isinstance(imported_profiles, dict):
+            imported_profiles = {}
+            gptprof["imported_profiles"] = imported_profiles
+        import_record = imported_profiles.get(slug)
+        recorded_fingerprints = _refresh_fingerprint_history(import_record)
+
+        pool_root = auth.setdefault("credential_pool", {})
+        if not isinstance(pool_root, dict):
+            pool_root = {}
+            auth["credential_pool"] = pool_root
+        pool = pool_root.get("openai-codex")
+        pool = pool if isinstance(pool, list) else []
+        entry_id = f"gptprof:{slug}"
+        current_entry = next(
+            (
+                item
+                for item in pool
+                if isinstance(item, dict)
+                and (
+                    item.get("id") == entry_id
+                    or item.get("source") == entry_id
+                    or _pool_entry_slug(item) == slug
+                )
+            ),
+            None,
+        )
+        fresh_reauth = bool(
+            recorded_fingerprints
+            and bootstrap_fingerprint
+            and bootstrap_fingerprint not in recorded_fingerprints
+        )
+        if current_entry is None and recorded_fingerprints and not fresh_reauth:
+            raise ValueError(
+                f"Profile {slug!r} has only stale bootstrap credentials; re-authenticate it"
+            )
+        current_status = str(
+            current_entry.get("last_status") if isinstance(current_entry, dict) else ""
+        ).strip().lower()
+        if current_status in {"dead", "exhausted"} and not fresh_reauth:
+            raise ValueError(
+                f"Profile {slug!r} is unavailable in CredentialPool ({current_status})"
+            )
+        current_complete = bool(
+            isinstance(current_entry, dict)
+            and current_entry.get("access_token")
+            and current_entry.get("refresh_token")
+        )
+        if current_entry is not None and not current_complete and not fresh_reauth:
+            raise ValueError(
+                f"Profile {slug!r} has an incomplete pool entry and stale bootstrap credentials"
+            )
+        runtime_tokens = (
+            current_entry
+            if current_complete and not fresh_reauth
+            else bootstrap_tokens
+        )
+        if not runtime_tokens.get("access_token") or not runtime_tokens.get("refresh_token"):
+            raise ValueError(f"Profile {slug!r} is missing a complete OAuth token pair")
+
+        selected_entry = (
+            dict(current_entry)
+            if isinstance(current_entry, dict) and not fresh_reauth
+            else {}
+        )
+        selected_entry.update(
+            {
+                "id": entry_id,
+                "source": "manual:device_code",
+                "profile": slug,
+                "label": slug,
+                "provider": "openai-codex",
+                "auth_type": "oauth",
+                "email": runtime_tokens.get("email") or profile.get("email"),
+                "plan": runtime_tokens.get("plan") or profile.get("plan"),
+                "access_token": runtime_tokens.get("access_token"),
+                "refresh_token": runtime_tokens.get("refresh_token"),
+                "base_url": auth_mod.DEFAULT_CODEX_BASE_URL,
+                "priority": 0,
+            }
+        )
+        if not current_entry or fresh_reauth:
+            selected_entry.update({"last_status": "ok", "last_status_at": time.time()})
+
         remaining_pool = []
         for item in pool:
             if not isinstance(item, dict):
                 continue
-            item_source = str(item.get("source") or "")
-            item_profile = str(item.get("profile") or item.get("label") or "")
-            if item_source in {source, "device_code"} or item_profile == slug:
+            if (
+                item.get("id") == entry_id
+                or item.get("source") == entry_id
+                or _pool_entry_slug(item) == slug
+            ):
                 continue
             if item.get("priority") == 0:
                 item = {**item, "priority": 10}
             remaining_pool.append(item)
         pool_root["openai-codex"] = [selected_entry, *remaining_pool]
 
-    save_json(AUTH_PATH, auth)
+        gptprof["active_profile"] = slug
+        if bootstrap_fingerprint:
+            if bootstrap_fingerprint not in recorded_fingerprints:
+                recorded_fingerprints.append(bootstrap_fingerprint)
+            imported_profiles[slug] = {
+                "refresh_fingerprints": recorded_fingerprints,
+            }
+
+        auth_mod._save_auth_store(auth, target_path=auth_path)
 
 
 def sync_from_intel64_openclaw(
@@ -327,54 +528,6 @@ print(json.dumps(out))
         cache.pop(slug, None)
         updated.append(slug)
     return updated
-
-
-async def refresh_profile_token(session: aiohttp.ClientSession, slug: str, profile: dict[str, Any]) -> tuple[bool, str | None]:
-    """Refresh an expired/near-expired Codex access token for usage checks."""
-    access_token = str(profile.get("access_token") or "")
-    refresh_token = str(profile.get("refresh_token") or "")
-    if not refresh_token:
-        return False, "refresh missing"
-    if not FORCE_REFRESH and not access_token_expiring(access_token):
-        return False, None
-    try:
-        async with session.post(
-            CODEX_OAUTH_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": CODEX_OAUTH_CLIENT_ID,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=USAGE_TIMEOUT),
-        ) as r:
-            if r.status != 200:
-                try:
-                    err_payload = await r.json()
-                    err_obj = err_payload.get("error") if isinstance(err_payload, dict) else None
-                    code = err_obj.get("code") if isinstance(err_obj, dict) else err_payload.get("error") if isinstance(err_payload, dict) else None
-                    if code:
-                        return False, str(code)
-                except Exception:
-                    pass
-                return False, f"refresh {r.status}"
-            payload = await r.json()
-    except Exception as exc:
-        return False, f"refresh {type(exc).__name__}"
-
-    new_access = payload.get("access_token")
-    if not isinstance(new_access, str) or not new_access.strip():
-        return False, "refresh missing access"
-    profile["access_token"] = new_access.strip()
-    new_refresh = payload.get("refresh_token")
-    if isinstance(new_refresh, str) and new_refresh.strip():
-        profile["refresh_token"] = new_refresh.strip()
-    profile["last_refresh"] = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-    profile["source"] = "hermes-local-refresh"
-    profile.pop("_refresh_error", None)
-    save_profile(slug, profile)
-    sync_active_auth(slug, profile)
-    return True, None
 
 
 def get_current_model() -> str:
@@ -568,26 +721,16 @@ async def main() -> None:
     from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
     bot = Bot(token=TOKEN)
-    profiles = load_profiles()
+    cache = load_cache()
+    profiles = overlay_runtime_profiles(load_profiles())
+    sync_from_intel64_openclaw(profiles, cache)
+    profiles = overlay_runtime_profiles(profiles)
     catalog = profile_catalog(profiles)
     current_slug = get_current_profile() or (catalog[0][0] if catalog else "")
     current_model = get_current_model()
 
-    cache = load_cache()
-    sync_from_intel64_openclaw(profiles, cache)
-    refresh_errors: dict[str, str] = {}
     connector = aiohttp.TCPConnector(limit=6, force_close=True)
     async with aiohttp.ClientSession(connector=connector) as session:
-        for slug, _plan, _model in catalog:
-            profile = profiles.get(slug) or {}
-            if profile.get("access_token"):
-                refreshed, err = await refresh_profile_token(session, slug, profile)
-                if refreshed:
-                    profiles[slug] = profile
-                    cache.pop(slug, None)
-                elif err:
-                    profile["_refresh_error"] = err
-                    refresh_errors[slug] = err
         tasks = []
         for slug, _plan, _model in catalog:
             token = str((profiles.get(slug) or {}).get("access_token") or "")
@@ -625,11 +768,6 @@ async def main() -> None:
         InlineKeyboardButton("🔄 Usage", callback_data="gptprof:refresh"),
         InlineKeyboardButton("🔁 Autoswitch", callback_data="gptprof:autoswitch"),
     ])
-    rows.append([
-        InlineKeyboardButton("➕ New auth", callback_data="gptprof:new_auth"),
-        InlineKeyboardButton("✅ Check auth", callback_data="gptprof:check_auth"),
-    ])
-    rows.append([InlineKeyboardButton("⤴ Back to Pi route", callback_data="gptprof:pi_route")])
     keyboard = InlineKeyboardMarkup(rows)
 
     await bot.send_message(

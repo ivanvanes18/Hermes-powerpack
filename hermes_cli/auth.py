@@ -43,7 +43,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
+from hermes_cli.config import (
+    get_hermes_home,
+    get_config_path,
+    read_raw_config,
+    require_readable_config_before_write,
+)
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
@@ -968,14 +973,7 @@ def _select_auth_store_owner_ids(
     existing_stat: Any,
     parent_stat: Any,
 ) -> Optional[Tuple[int, int]]:
-    """Choose the POSIX owner for root-written auth-store files.
-
-    Root-run install/auth helpers may write into a service user's
-    ``HERMES_HOME``.  Atomic replace would otherwise leave ``auth.json`` owned
-    by root, and the final 0600 mode then makes the gateway's service user
-    unable to read its own credentials.  Prefer an existing non-root file
-    owner; otherwise inherit the auth directory owner.
-    """
+    """Choose the POSIX owner for auth files written by root."""
     if existing_stat is not None and getattr(existing_stat, "st_uid", 0) != 0:
         return int(existing_stat.st_uid), int(existing_stat.st_gid)
     if parent_stat is not None and getattr(parent_stat, "st_uid", 0) != 0:
@@ -991,18 +989,14 @@ def _auth_store_owner_ids_for_root_write(path: Path) -> Optional[Tuple[int, int]
     if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
         return None
 
-    existing_stat = None
     try:
         existing_stat = path.stat()
     except OSError:
-        pass
-
-    parent_stat = None
+        existing_stat = None
     try:
         parent_stat = path.parent.stat()
     except OSError:
-        pass
-
+        parent_stat = None
     return _select_auth_store_owner_ids(existing_stat, parent_stat)
 
 
@@ -1017,16 +1011,35 @@ def _apply_auth_store_owner(path: Path, owner_ids: Optional[Tuple[int, int]]) ->
 
 def _repair_auth_lock_owner_for_root() -> None:
     lock_path = _auth_lock_path()
+    try:
+        if stat.S_ISLNK(lock_path.lstat().st_mode):
+            return
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return
     owner_ids = _auth_store_owner_ids_for_root_write(lock_path)
     if owner_ids is None:
         return
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path.touch(mode=stat.S_IRUSR | stat.S_IWUSR, exist_ok=True)
-        _apply_auth_store_owner(lock_path, owner_ids)
-        lock_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        fd = os.open(str(lock_path), flags, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return
+        if os.name == "posix" and hasattr(os, "fchown"):
+            os.fchown(fd, owner_ids[0], owner_ids[1])
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
+    finally:
+        os.close(fd)
 
 
 _auth_lock_holder = threading.local()
@@ -1071,7 +1084,16 @@ def _file_lock(
     if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
         lock_path.write_text(" ", encoding="utf-8")
 
-    with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
+    if msvcrt:
+        lock_context = lock_path.open("r+", encoding="utf-8")
+    else:
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(lock_path), flags, stat.S_IRUSR | stat.S_IWUSR)
+        lock_context = os.fdopen(fd, "a+", encoding="utf-8")
+
+    with lock_context as lock_file:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
         while True:
             try:
@@ -1558,6 +1580,33 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 continue
             if has_usable_secret(os.getenv(env_var, "")):
                 return True
+
+    # 4. Check persisted credential-pool entries that came from EXPLICIT flows
+    # the user initiated inside Hermes (manual add / device-code / PKCE), plus
+    # env-backed pool entries. This intentionally excludes ambient borrowed
+    # sources like gh_cli / claude_code / qwen-cli.
+    try:
+        for entry in read_credential_pool(normalized):
+            if not isinstance(entry, dict):
+                continue
+            source = str(entry.get("source") or "").strip().lower()
+            if not source:
+                continue
+            if source.startswith("env:"):
+                # A stale env-seeded pool entry survives in auth.json after
+                # the user deletes the env var (#55790) — only count it when
+                # the referenced var still resolves to a usable secret NOW.
+                env_var = entry.get("source", "").split(":", 1)[1].strip()
+                if env_var and has_usable_secret(os.getenv(env_var, "")):
+                    return True
+                continue
+            if (
+                source in {"device_code", "loopback_pkce", "hermes_pkce", "manual"}
+                or source.startswith("manual:")
+            ):
+                return True
+    except Exception:
+        pass
 
     return False
 
@@ -4924,6 +4973,58 @@ def _quarantine_nous_oauth_state(
     reason: str,
 ) -> None:
     """Keep routing metadata but remove dead OAuth material so it is not replayed."""
+    # Forensic logging BEFORE we clear the token material. A NAS-hosted Fly agent
+    # can take a terminal invalid_grant and get quarantined here silently: the
+    # only downstream signal is a "No access token found" WARNING once the pool
+    # is already empty, which is too late to root-cause. The Fly log drain is
+    # WARNING-only, so this MUST be logger.warning (INFO never reaches the drain).
+    #
+    # Redaction safety: emit ONLY the 12-char SHA-256 hex prefix of the refresh
+    # token (correlates to NAS's refreshTokenHash without leaking the secret) plus
+    # sizes/booleans. NEVER pass a raw token/agent_key into the log call — Hermes
+    # has a known bug class where credential-shaped literals get corrupted in logs.
+    forensic: Dict[str, Any] = {
+        "reason": reason,
+        "error_code": error.code,
+        # No session_id field exists on Nous state; provenance is client_id +
+        # agent_key_id (both non-secret routing identifiers).
+        "client_id": state.get("client_id"),
+        "agent_key_id": state.get("agent_key_id"),
+        "refresh_token_fp": _token_fingerprint(state.get("refresh_token")),
+    }
+
+    # On-disk integrity of the auth store at the moment of quarantine.
+    try:
+        auth_path = _auth_file_path()
+        forensic["auth_json_path"] = str(auth_path)
+        try:
+            st = os.stat(auth_path)
+            forensic["auth_json_size"] = st.st_size
+            forensic["auth_json_mtime"] = st.st_mtime
+            forensic["auth_json_exists"] = True
+        except FileNotFoundError:
+            forensic["auth_json_exists"] = False
+    except Exception as exc:  # pragma: no cover - never let logging break quarantine
+        forensic["auth_json_stat_error"] = repr(exc)
+
+    # Was the token already past its own expiry when it was rejected?
+    already_expired: Optional[bool] = None
+    expires_at_raw = state.get("expires_at")
+    if isinstance(expires_at_raw, str) and expires_at_raw:
+        try:
+            parsed = datetime.fromisoformat(expires_at_raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            already_expired = parsed < datetime.now(timezone.utc)
+        except ValueError:
+            already_expired = None
+    forensic["token_already_expired"] = already_expired
+
+    logger.warning(
+        "Nous OAuth state quarantined (terminal auth death): %s",
+        json.dumps(forensic, sort_keys=True, ensure_ascii=False),
+    )
+
     for key in (
         "access_token",
         "refresh_token",
@@ -5980,6 +6081,75 @@ def _compute_nous_auth_status() -> Dict[str, Any]:
     return _snapshot_nous_pool_status()
 
 
+# Enum values reported on the dashboard /api/status as ``nous_session_valid``.
+# NAS's health sweep re-mints the bootstrap session ONLY on "terminal"; "valid"
+# and "unknown" are no-ops. Keep this set small and stable — NAS parses it with
+# a permissive schema, so new members are non-breaking but should stay rare.
+NOUS_SESSION_VALID = "valid"
+NOUS_SESSION_TERMINAL = "terminal"
+NOUS_SESSION_UNKNOWN = "unknown"
+
+
+def get_nous_session_validity() -> str:
+    """Classify the Nous bootstrap session for the dashboard /api/status probe.
+
+    Returns one of:
+      - ``"valid"``    — a usable Nous credential is present (login healthy).
+      - ``"terminal"`` — the Nous session has taken a terminal auth failure
+        (invalid_grant / quarantined / relogin required). This is the sole
+        signal NAS acts on to re-mint a hosted-agent bootstrap session.
+      - ``"unknown"``  — indeterminate (no Nous provider state, or a transient/
+        non-terminal error). Never triggers a re-mint.
+
+    Determinable with NO working token — it reads local auth-store state only,
+    which is exactly the condition a dead hosted box is in.
+
+    ANTI-FLAP CONTRACT: only a *terminal* failure maps to "terminal". A normal
+    mid-rotation blip, a transient network error, or a merely-expiring token
+    must NOT report "terminal" (that would trigger a spurious NAS re-mint on a
+    healthy box). We key "terminal" on the auth layer's own terminal signal
+    (`relogin_required`) plus a persisted quarantine marker, never on a bare
+    "not logged in".
+    """
+    # A persisted quarantine marker is the strongest, most stable terminal
+    # signal: the refresh path writes `last_auth_error.relogin_required=True`
+    # into the Nous provider state when it clears dead tokens (the exact path
+    # that produced the incident's "No access token found"). Read it directly
+    # so we report "terminal" even after the in-memory AuthError is long gone.
+    try:
+        state = get_provider_auth_state("nous")
+    except Exception:
+        state = None
+
+    if state:
+        last_err = state.get("last_auth_error")
+        if isinstance(last_err, dict) and last_err.get("relogin_required"):
+            # Only terminal while there is no usable credential left. If a later
+            # successful login repopulated tokens, the stale marker must not
+            # keep reporting terminal.
+            if not (state.get("access_token") or state.get("refresh_token")):
+                return NOUS_SESSION_TERMINAL
+
+    try:
+        status = get_nous_auth_status()
+    except Exception:
+        # Status computation itself failed — indeterminate, not terminal.
+        return NOUS_SESSION_UNKNOWN
+
+    if status.get("logged_in"):
+        return NOUS_SESSION_VALID
+
+    # Not logged in. Distinguish a terminal (relogin-required) failure from a
+    # transient / indeterminate one. Only the former is actionable by NAS.
+    if status.get("relogin_required"):
+        return NOUS_SESSION_TERMINAL
+
+    # No Nous provider state at all, or a non-terminal not-logged-in condition
+    # (e.g. a transient refresh error that did not set relogin_required). Treat
+    # as unknown so a healthy box mid-blip never triggers a re-mint.
+    return NOUS_SESSION_UNKNOWN
+
+
 def get_codex_auth_status() -> Dict[str, Any]:
     """Status snapshot for Codex auth.
     
@@ -6404,6 +6574,7 @@ def _update_config_for_provider(
     # Update config.yaml model section
     config_path = get_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    require_readable_config_before_write(config_path)
 
     config = read_raw_config()
 
@@ -6496,6 +6667,7 @@ def _reset_config_provider() -> Path:
     config_path = get_config_path()
     if not config_path.exists():
         return config_path
+    require_readable_config_before_write(config_path)
 
     config = read_raw_config()
     if not config:

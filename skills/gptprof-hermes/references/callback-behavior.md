@@ -6,7 +6,7 @@ When a user presses a profile button in the Telegram card, the callback `gptprof
 
 The gateway code lives in:
 ```
-hermes-agent/gateway/platforms/telegram.py
+hermes-agent/plugins/platforms/telegram/adapter.py
   → _handle_gptprof_callback(query, profile, model)
 ```
 
@@ -40,22 +40,19 @@ await _handle_gptprof_callback(query, profile, model)
 
 Inside `_handle_gptprof_callback`:
 
-1. **Copy OAuth tokens** — reads `~/.hermes/gptprof/profiles/<profile>.json`, copies `access_token` + `refresh_token` to `auth.json → codex`
+1. **Select the pool entry** — imports `gptprof:<profile>` as an owned `manual:device_code` credential on first use, then prefers current CredentialPool tokens. The stored fingerprint history prevents any previously imported bootstrap chain from being resurrected; only a refresh token absent from that history is treated as explicit re-authentication.
 
 2. **Write global config.yaml** (critical step):
    ```python
-   cfg["model"] = model          # "gpt-5.5"
-   cfg["provider"] = "openai-codex"
-   with open(config_path, "w") as f:
-       yaml.safe_dump(cfg, f)
+   cfg["model"] = {
+       "default": model,         # "gpt-5.5"
+       "provider": "openai-codex",
+   }
+   save_config(cfg, preserve_keys={("model", "default"), ("model", "provider")})
    ```
    This persists the model switch across gateway restarts.
 
-3. **Set session override** — updates `_session_model_overrides[session_key]` so the current session immediately uses the new model.
-
-4. **Evict cached agent** — calls `_evict_cached_agent(session_key)` to force fresh agent creation with new model on next turn.
-
-5. **Confirm to user** — shows alert and edits message:
+3. **Confirm to user** — shows an alert and recommends `/new` so the next session resolves the persisted route.
    ```
    ✅ Профиль активирован
    `profile3` (Plus)
@@ -70,8 +67,9 @@ Without step 2, the model switch would only survive until the next gateway resta
 
 With step 2, `config.yaml` now contains:
 ```yaml
-model: gpt-5.5
-provider: openai-codex
+model:
+  default: gpt-5.5
+  provider: openai-codex
 ```
 
 So after any restart, Hermes starts with the selected GPT model, not the old default.
@@ -80,20 +78,17 @@ So after any restart, Hermes starts with the selected GPT model, not the old def
 
 | Action | Survives Restart? |
 |--------|------------------|
-| Session override (step 3) | ❌ — lost on restart |
 | `config.yaml` write (step 2) | ✅ — persists |
-| OAuth token copy (step 1) | ✅ — tokens are stored in `auth.json` which survives restarts |
+| CredentialPool selection (step 1) | ✅ — pool state is stored in `auth.json` and survives restarts |
 
-Both session override AND config.yaml write are needed:
-- Session override → immediate effect in current session
-- config.yaml write → effect after restart
+The callback intentionally does not mutate an already-running session. Use `/new` after switching so route and credentials are resolved together from persisted state.
 
 ## Gateway Restart Caveat
 
-After changing `config.yaml`, the gateway must be restarted to reload the new values. However, the session override handles immediate use. The user should `/new` for a clean session after pressing a button.
+The user should `/new` for a clean session after pressing a button. A gateway restart is not required for the persisted route itself.
 
 ## Related Files
 
-- `/opt/hermes-agent/gateway/platforms/telegram.py` — `_handle_gptprof_callback`
+- `plugins/platforms/telegram/adapter.py` — `_handle_gptprof_callback`
 - `/opt/hermes-agent/gateway/run.py` — `/model --global` persistence logic
 - `bin/send_buttons.py` — upstream card sender (callback_data format only)

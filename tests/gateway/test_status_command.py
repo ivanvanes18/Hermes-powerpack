@@ -2,6 +2,7 @@ from hermes_state import AsyncSessionDB
 """Tests for gateway /status behavior and token persistence."""
 
 from datetime import datetime
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -60,11 +61,13 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
     # the populated path override this.
     runner._session_db._db.get_session.return_value = None
     runner._reasoning_config = None
+    runner._session_model_overrides = {}
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._agent_cache = {}
     runner._agent_cache_lock = MagicMock()
     runner._show_reasoning = False
+    runner._resolve_session_reasoning_config = MagicMock(return_value={})
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
@@ -103,6 +106,7 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
     assert "🧮 Tokens: 200 in / 121 out · total 321" in result
     assert "Agent: running ⚡" in result
     assert "My titled session" not in result
+    assert "**Cumulative API tokens" not in result
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}
 
@@ -153,7 +157,7 @@ async def test_status_command_reads_token_totals_from_session_db():
     result = await runner._handle_message(_make_event("/status"))
 
     # 1000 + 250 + 500 + 100 + 50 = 1,900
-    assert "**Cumulative API tokens (re-sent each call):** 1,900" in result
+    assert "🧮 Tokens: 1k in / 250 out · total 1.9k" in result
 
 
 @pytest.mark.asyncio
@@ -174,7 +178,7 @@ async def test_status_command_tokens_zero_when_session_db_row_missing():
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Cumulative API tokens (re-sent each call):** 0" in result
+    assert "🧮 Tokens: 0 in / 0 out · total 0" in result
 
 
 @pytest.mark.asyncio
@@ -210,10 +214,11 @@ async def test_status_command_includes_live_agent_model_and_context():
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Model:** `openai/gpt-test` (openai)" in result
-    assert "**Context:** 12,345 / 100,000 (12%)" in result
-    assert "**Cumulative API tokens (re-sent each call):** 1,250" in result
-    assert "1,250 (cumulative)" not in result
+    assert "🧠 Model: openai/gpt-test" in result
+    assert "openai/openai/gpt-test" not in result
+    assert "📚 Context: 12.3k/100k (12%)" in result
+    assert "🧮 Tokens: 1k in / 250 out · total 1.2k" in result
+    assert "**Model:**" not in result
 
 
 @pytest.mark.asyncio
@@ -243,9 +248,9 @@ async def test_status_command_includes_persisted_model_and_context_when_agent_no
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Model:** `openai/gpt-persisted` (openai-codex)" in result
-    assert "**Context:** 24,000 / 272,000 (9%)" in result
-    assert "**Cumulative API tokens (re-sent each call):** 2,500" in result
+    assert "🧠 Model: openai/gpt-persisted (openai-codex)" in result
+    assert "📚 Context: 24k/272k (9%)" in result
+    assert "🧮 Tokens: 2k in / 500 out · total 2.5k" in result
 
 
 @pytest.mark.asyncio
@@ -272,8 +277,99 @@ async def test_status_command_includes_cached_agent_model_and_context():
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Model:** `anthropic/claude-sonnet-test` (openrouter)" in result
-    assert "**Context:** 10,000 / 200,000 (5%)" in result
+    assert "🧠 Model: anthropic/claude-sonnet-test (openrouter)" in result
+    assert "📚 Context: 10k/200k (5%)" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_prefers_persisted_runtime_tuple_after_model_switch():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._session_db._db.get_session.return_value = {
+        "model": "glm",
+        "billing_provider": "openai-codex",
+        "model_config": json.dumps(
+            {
+                "model": "glm",
+                "provider": "relay-provider",
+                "base_url": "https://relay.example/v1",
+                "api_mode": "chat_completions",
+            }
+        ),
+    }
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🧠 Model: relay-provider/glm" in result
+    assert "openai-codex/glm" not in result
+    assert "**Model:**" not in result
+
+
+@pytest.mark.asyncio
+async def test_model_switch_persists_runtime_tuple():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"model_config": "{}"}),
+        update_session_meta=AsyncMock(),
+    )
+    result = SimpleNamespace(
+        new_model="glm",
+        target_provider="relay-provider",
+        base_url="https://relay.example/v1",
+        api_mode="chat_completions",
+    )
+
+    await runner._persist_model_switch_runtime("sess-1", result)
+
+    runner._session_db.update_session_meta.assert_awaited_once()
+    session_id, payload, model = runner._session_db.update_session_meta.await_args.args
+    assert session_id == "sess-1"
+    assert model == "glm"
+    assert json.loads(payload) == {
+        "model": "glm",
+        "provider": "relay-provider",
+        "base_url": "https://relay.example/v1",
+        "api_mode": "chat_completions",
+        "billing_provider": "relay-provider",
+        "billing_base_url": "https://relay.example/v1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_command_survives_runtime_config_expansion_error(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_runtime_config",
+        MagicMock(side_effect=ValueError("missing template variable")),
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🆔 Session ID: `sess-1`" in result
+    assert "🧠 Model: unknown" in result
 
 
 @pytest.mark.asyncio

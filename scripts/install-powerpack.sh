@@ -16,10 +16,10 @@ python -m pip install -e .
 mkdir -p "$HOME/.local/bin"
 ln -sf "$ROOT/$VENV_DIR/bin/hermes" "$HOME/.local/bin/hermes"
 
-# gptprof-hermes optional runtime helpers. These are public-safe wrappers; they
-# read tokens only from the user's own ~/.hermes/gptprof/profiles/*.json.
+# gptprof-hermes optional runtime helpers. Profile files are bootstrap inputs;
+# imported credentials are maintained by Hermes CredentialPool.
 if [ -d "$ROOT/skills/gptprof-hermes/bin" ]; then
-  install -m 700 "$ROOT/skills/gptprof-hermes/bin/codex-profile-manager.py" "$HOME/.local/bin/codex-profile-manager.py"
+  install -m 700 "$ROOT/skills/gptprof-hermes/bin/send_buttons.py" "$HOME/.local/bin/send_buttons.py"
   install -m 700 "$ROOT/skills/gptprof-hermes/bin/send_buttons.py" "$HOME/.local/bin/gptprof_send_buttons.py"
   install -m 700 "$ROOT/skills/gptprof-hermes/bin/refresh_profiles.py" "$HOME/.local/bin/gptprof_refresh_profiles.py"
   install -m 700 "$ROOT/skills/gptprof-hermes/bin/gptprof_autoswitch.py" "$HOME/.local/bin/gptprof_autoswitch.py"
@@ -33,14 +33,24 @@ export VENV_DIR
 from pathlib import Path
 import os
 import yaml
+from hermes_cli.config import is_managed, save_config
+
 home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
 config_path = home / "config.yaml"
-try:
-    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-except Exception:
+if is_managed():
+    print("Managed Hermes config detected; Powerpack quick commands were not modified.")
+    raise SystemExit(0)
+if config_path.exists():
+    try:
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise SystemExit(
+            f"Refusing to overwrite unreadable or invalid {config_path}: {exc}"
+        ) from exc
+else:
     cfg = {}
 if not isinstance(cfg, dict):
-    cfg = {}
+    raise SystemExit(f"Refusing to overwrite non-mapping config: {config_path}")
 quick = cfg.setdefault("quick_commands", {})
 if not isinstance(quick, dict):
     quick = {}
@@ -52,7 +62,7 @@ def add(name, value):
 add("gptt", {"type": "alias", "target": "/model gpt-5.5 --provider openai-codex --global"})
 add("mmfast", {"type": "alias", "target": "/model MiniMax-M2.7 --provider minimax --global"})
 add("gptprof", {"type": "exec", "command": f"{python_bin} ~/.local/bin/gptprof_send_buttons.py"})
-config_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
+save_config(cfg, strip_defaults=False)
 PY
 
 case ":$PATH:" in

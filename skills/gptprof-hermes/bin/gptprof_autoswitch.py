@@ -7,10 +7,10 @@ profile is below threshold and no healthy alternative exists.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import importlib.util
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -19,10 +19,21 @@ import aiohttp
 
 HERE = Path(__file__).resolve().parent
 SEND_BUTTONS = Path(os.getenv("GPTPROF_SEND_BUTTONS", str(HERE / "send_buttons.py")))
-AUTH_PATH = Path(os.getenv("HERMES_AUTH", "/home/hermes/.hermes/auth.json"))
+HERMES_HOME = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
 THRESHOLD = int(os.getenv("GPTPROF_AUTOSWITCH_THRESHOLD", "5"))
-LOCK_PATH = Path(os.getenv("GPTPROF_AUTOSWITCH_LOCK", "/tmp/gptprof-autoswitch.lock"))
-STATE_PATH = Path(os.getenv("GPTPROF_AUTOSWITCH_STATE", "/tmp/gptprof_autoswitch_state.json"))
+LOCK_PATH = Path(
+    os.getenv(
+        "GPTPROF_AUTOSWITCH_LOCK",
+        str(HERMES_HOME / "run" / "gptprof-autoswitch.lock"),
+    )
+).expanduser()
+STATE_PATH = Path(
+    os.getenv(
+        "GPTPROF_AUTOSWITCH_STATE",
+        str(HERMES_HOME / "gptprof" / "autoswitch-state.json"),
+    )
+).expanduser()
+LOCK_HOLDER = threading.local()
 
 spec = importlib.util.spec_from_file_location("gptprof_send_buttons", SEND_BUTTONS)
 if spec is None or spec.loader is None:
@@ -53,15 +64,15 @@ def should_switch(usage: dict[str, Any]) -> bool:
 
 def load_state() -> dict[str, Any]:
     try:
+        if STATE_PATH.is_symlink():
+            return {}
         return json.loads(STATE_PATH.read_text())
     except Exception:
         return {}
 
 
 def save_state(state: dict[str, Any]) -> None:
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-    tmp.replace(STATE_PATH)
+    gptprof.save_json(str(STATE_PATH), state)
 
 
 def profile_catalog(profiles: dict[str, dict[str, Any]]) -> list[tuple[str, str, str]]:
@@ -80,80 +91,13 @@ def profile_catalog(profiles: dict[str, dict[str, Any]]) -> list[tuple[str, str,
 
 def switch_profile_auth(slug: str, profile: dict[str, Any]) -> None:
     """Switch auth only; do not change model/provider route."""
-    auth = gptprof.load_json(str(AUTH_PATH), {})
-    if not isinstance(auth, dict):
-        auth = {}
-    codex = dict(auth.get("codex") or {})
-    codex.update({
-        "profile": slug,
-        "email": profile.get("email"),
-        "plan": profile.get("plan"),
-        "access_token": profile.get("access_token"),
-        "refresh_token": profile.get("refresh_token"),
-    })
-    auth["codex"] = codex
-
-    providers = auth.setdefault("providers", {})
-    provider_state = providers.setdefault("openai-codex", {})
-    provider_tokens = dict(provider_state.get("tokens") or {})
-    provider_tokens.update({
-        "profile": slug,
-        "email": profile.get("email"),
-        "plan": profile.get("plan"),
-        "access_token": profile.get("access_token"),
-        "refresh_token": profile.get("refresh_token"),
-    })
-    provider_state["tokens"] = provider_tokens
-    provider_state["auth_mode"] = "chatgpt"
-    provider_state.pop("last_auth_error", None)
-    auth["active_provider"] = "openai-codex"
-
-    pool_root = auth.setdefault("credential_pool", {})
-    pool = pool_root.get("openai-codex")
-    if not isinstance(pool, list):
-        pool = []
-    source = f"gptprof:{slug}"
-    selected = {
-        "source": source,
-        "profile": slug,
-        "label": slug,
-        "provider": "openai-codex",
-        "email": profile.get("email"),
-        "plan": profile.get("plan"),
-        "access_token": profile.get("access_token"),
-        "refresh_token": profile.get("refresh_token"),
-        "priority": 0,
-        "last_status": "ok",
-        "last_status_at": time.time(),
-    }
-    rest = []
-    for item in pool:
-        if not isinstance(item, dict):
-            continue
-        item_source = str(item.get("source") or "")
-        item_profile = str(item.get("profile") or item.get("label") or "")
-        if item_source in {source, "device_code"} or item_profile == slug:
-            continue
-        if item.get("priority") == 0:
-            item = {**item, "priority": 10}
-        rest.append(item)
-    pool_root["openai-codex"] = [selected, *rest]
-    gptprof.save_json(str(AUTH_PATH), auth)
+    gptprof.sync_active_auth(slug, profile)
 
 
 async def collect_usage(profiles: dict[str, dict[str, Any]], catalog: list[tuple[str, str, str]]) -> dict[str, dict[str, Any]]:
     cache = gptprof.load_cache()
     connector = aiohttp.TCPConnector(limit=6, force_close=True)
     async with aiohttp.ClientSession(connector=connector) as session:
-        for slug, _plan, _model in catalog:
-            profile = profiles.get(slug) or {}
-            if profile.get("access_token"):
-                refreshed, err = await gptprof.refresh_profile_token(session, slug, profile)
-                if refreshed:
-                    profiles[slug] = profile
-                    cache.pop(slug, None)
-                elif err:
-                    profile["_refresh_error"] = err
         tasks = []
         for slug, _plan, _model in catalog:
             token = str((profiles.get(slug) or {}).get("access_token") or "")
@@ -165,14 +109,20 @@ async def collect_usage(profiles: dict[str, dict[str, Any]], catalog: list[tuple
 
 
 async def main() -> int:
-    LOCK_PATH.touch(exist_ok=True)
-    with LOCK_PATH.open("r+") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return 0
+    from hermes_cli import auth as auth_mod
 
-        profiles = gptprof.load_profiles()
+    try:
+        lock = auth_mod._file_lock(
+            LOCK_PATH,
+            LOCK_HOLDER,
+            1.0,
+            "gptprof autoswitch already running",
+        )
+        lock.__enter__()
+    except TimeoutError:
+        return 0
+    try:
+        profiles = gptprof.overlay_runtime_profiles(gptprof.load_profiles())
         catalog = profile_catalog(profiles)
         current = gptprof.get_current_profile() or (catalog[0][0] if catalog else None)
         if not current:
@@ -181,6 +131,10 @@ async def main() -> int:
 
         usage_map = await collect_usage(profiles, catalog)
         current_usage = usage_map.get(current, {})
+        current_profile = profiles.get(current) or {}
+        if current_profile.get("_refresh_error"):
+            current_usage = dict(current_usage)
+            current_usage["usage_error"] = str(current_profile["_refresh_error"])
         if not should_switch(current_usage):
             return 0
 
@@ -189,7 +143,7 @@ async def main() -> int:
             if slug == current:
                 continue
             profile = profiles.get(slug) or {}
-            if not profile.get("access_token"):
+            if not profile.get("access_token") or profile.get("_refresh_error"):
                 continue
             sc = score(usage_map.get(slug, {}))
             if sc > THRESHOLD:
@@ -228,6 +182,8 @@ async def main() -> int:
             "model unchanged"
         )
         return 0
+    finally:
+        lock.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

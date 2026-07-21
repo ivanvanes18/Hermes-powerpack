@@ -1,6 +1,6 @@
 ---
 name: gptprof-hermes
-description: "Public Hermes skill: ChatGPT profile card with Telegram inline buttons showing remaining %, /gptt /mmfast aliases (both persistent --global), autoswitch on limit exhaustion. Callback writes global config.yaml — not just session override."
+description: "Public Hermes skill: ChatGPT profile card with Telegram inline buttons, stable CredentialPool ownership, persistent /gptt /mmfast aliases, and autoswitch on quota exhaustion."
 user-invocable: true
 disable-model-invocation: true
 command-dispatch: tool
@@ -19,14 +19,12 @@ Hermes-native skill for ChatGPT profile management: Telegram card with inline bu
 | `/gptprof` | Show profile selection card with inline buttons (remaining % 5h / weekly per button) |
 | `/gptt` | Switch to `gpt-5.5` via `openai-codex` provider, **persistent** (`--global`) |
 | `/mmfast` | Switch back to `MiniMax-M2.7` with high reasoning, **persistent** (`--global`) |
-| `/gptprof status` | Full CLI status via `codex-profile-manager.py status` |
-| `/gptprof refresh` | Force-refresh usage cache |
 | `/gptprof autoswitch` | Run autoswitch logic (switches when active 5h or weekly remaining is ≤5%, or usage/auth error appears) |
 
 ## How the Card Works
 
-1. `send_buttons.py` reads profile tokens from `$HERMES_HCP/*.json`
-2. Locally refreshes expired/near-expired Codex access tokens through OAuth refresh_token rotation
+1. `send_buttons.py` reads the bootstrap profile catalog from `$HERMES_HCP/*.json`
+2. Overlays current tokens from Hermes `credential_pool.openai-codex`; the pool is canonical after first import
 3. Fetches usage from `https://chatgpt.com/backend-api/wham/usage` for each profile in parallel
 4. Computes **remaining %** = `100 − used_percent` for both windows
 5. Sends a Telegram `InlineKeyboardMarkup` card to `$GPTPROF_CHAT_ID`
@@ -35,19 +33,20 @@ Hermes-native skill for ChatGPT profile management: Telegram card with inline bu
 
 ## Callback Behavior (critical)
 
-Button presses are handled by **Hermes gateway** (`gateway/platforms/telegram.py`), not by `send_buttons.py`.
+Button presses are handled by the **Hermes Telegram adapter** (`plugins/platforms/telegram/adapter.py`), not by `send_buttons.py`.
 
-On `gptprof:<slug>:<model>` callback, the gateway:
+On `gptprof:<slug>:<model>` callback, the Telegram adapter:
 
-1. Copies `access_token` + `refresh_token` from `~/.hermes/gptprof/profiles/<slug>.json` → `auth.json → codex`
+1. Imports or selects `gptprof:<slug>` as an owned `manual:device_code` entry in `credential_pool.openai-codex`; an existing pool entry wins over stale bootstrap tokens, while every previously imported refresh-token fingerprint remains blocked after deletion or rollback
 2. **Writes global config.yaml**:
    ```python
-   cfg["model"] = model          # e.g. "gpt-5.5"
-   cfg["provider"] = "openai-codex"
+   cfg["model"] = {
+       "default": model,         # e.g. "gpt-5.5"
+       "provider": "openai-codex",
+   }
    ```
    This is equivalent to `/model <model> --provider openai-codex --global`.
-3. Sets session override at gateway level
-4. Evicts cached agent
+3. Recommends `/new` so the next session uses the persisted route
 
 **Why this matters:** Without step 2, gateway restarts would reset the model back to the pre-switch default. With step 2, the model is persisted in `config.yaml` and survives restarts.
 
@@ -59,14 +58,13 @@ See `references/callback-behavior.md` for full details.
 |----------|---------|-------|
 | `TELEGRAM_BOT_TOKEN` | env | Bot token for sending cards |
 | `GPTPROF_CHAT_ID` | env | Telegram chat ID for card delivery |
-| `HERMES_AUTH` | `/home/hermes/.hermes/auth.json` | Active profile detection |
-| `HERMES_CONFIG` | `/home/hermes/.hermes/config.yaml` | Model name display + global persistence |
 | `HERMES_HCP` | `~/.hermes/gptprof/profiles` | Profile token directory |
-| `GPTPROF_ACCESS_REFRESH_SKEW` | `172800` | Refresh access tokens this many seconds before expiry |
-| `GPTPROF_FORCE_REFRESH` | `0` | Set `1` for one-off validation/rotation |
+| `GPTPROF_ACCESS_REFRESH_SKEW` | `172800` | Freshness comparison for the optional break-glass import |
 | `GPTPROF_INTEL64_OPENCLAW_SYNC` | `0` | Break-glass import from OpenClaw; not the primary path |
 | `GPTPROF_AUTOSWITCH_THRESHOLD` | `5` | Switch when either 5h or weekly remaining is at/below this % |
-| `GPTPROF_AUTOSWITCH_STATE` | `/tmp/gptprof_autoswitch_state.json` | Last switch / no-candidate state |
+| `GPTPROF_REFRESH_LOCK` | `$HERMES_HOME/run/gptprof-token-refresh.lock` | Hardened refresh lock |
+| `GPTPROF_AUTOSWITCH_LOCK` | `$HERMES_HOME/run/gptprof-autoswitch.lock` | Hardened autoswitch lock |
+| `GPTPROF_AUTOSWITCH_STATE` | `$HERMES_HOME/gptprof/autoswitch-state.json` | Atomic last-switch / no-candidate state |
 
 ## Profile Token Directory
 
@@ -79,15 +77,15 @@ Tokens live in `$HERMES_HCP/*.json`, one file per profile slug:
 └── profile3.json
 ```
 
-Each file must contain an `access_token` key. The active profile is read from `auth.json`'s `codex.profile` field.
+Each file must initially contain a complete OAuth token pair. After import, the file is bootstrap/catalog data only: current tokens and refresh state live in Hermes CredentialPool. Hermes records the history of non-secret refresh-token fingerprints under `gptprof.imported_profiles`; deleting a pool entry or rolling the file back cannot resurrect any already-consumed bootstrap chain. Re-authentication is accepted when the bootstrap refresh token has never been imported before. Auth and config always use the canonical `$HERMES_HOME` paths. The active slug is stored under `gptprof.active_profile`.
 
 ## Local Token Refresh
 
-Hermes can maintain its own OAuth tokens without treating OpenClaw as the canonical source:
+Hermes CredentialPool is the only local owner of OAuth rotation. The helper delegates to the stable pool implementation and never writes rotated tokens back to bootstrap profile files:
 
 ```bash
-/opt/hermes-agent/venv/bin/python3 ~/.local/bin/refresh_profiles.py
-/opt/hermes-agent/venv/bin/python3 ~/.local/bin/refresh_profiles.py --force  # validate/rotate now
+python3 ~/.local/bin/gptprof_refresh_profiles.py
+python3 ~/.local/bin/gptprof_refresh_profiles.py --force
 ```
 
 Recommended systemd timer:
@@ -98,8 +96,7 @@ Recommended systemd timer:
 Type=oneshot
 User=hermes
 Environment=GPTPROF_INTEL64_OPENCLAW_SYNC=0
-Environment=GPTPROF_ACCESS_REFRESH_SKEW=172800
-ExecStart=/opt/hermes-agent/venv/bin/python3 /home/hermes/.local/bin/refresh_profiles.py
+ExecStart=<venv-python> <runtime-home>/.local/bin/gptprof_refresh_profiles.py
 ```
 
 ```ini
@@ -115,7 +112,7 @@ Unit=gptprof-token-refresh.service
 WantedBy=timers.target
 ```
 
-`refresh_token_reused` means the refresh token was already stale before this timer owned it; recover via a fresh device-code auth for that profile.
+`refresh_token_reused` means another process already consumed that single-use chain. Stop the other refresher and re-authenticate that profile before importing it again.
 
 ## Autoswitch cron
 
@@ -151,15 +148,6 @@ quick_commands:
 
 **Both aliases use `--global`** — this is what makes them survive gateway restarts. Without `--global`, the switch is session-only and resets on restart.
 
-## Autoswitch Logic
-
-From `codex-profile-manager.py autoswitch`:
-
-- Triggers only when **active profile** hits **≥95%** on either window
-- Requires a **healthy spare** (<95% on both windows) to exist
-- Schedules a gateway restart after switching so all sessions reload auth
-- Safe: if target is also over threshold, no switch happens
-
 ## Installation
 
 ```bash
@@ -167,12 +155,10 @@ From `codex-profile-manager.py autoswitch`:
 git clone https://github.com/evgyur/gptprof-hermes.git ~/gptprof-hermes
 
 # Binaries
-cp bin/codex-profile-manager.py ~/.local/bin/codex-profile-manager.py
-cp bin/send_buttons.py         ~/.local/bin/send_buttons.py
-cp bin/refresh_profiles.py     ~/.local/bin/refresh_profiles.py
-chmod 700 ~/.local/bin/codex-profile-manager.py
-chmod 700 ~/.local/bin/send_buttons.py
-chmod 700 ~/.local/bin/refresh_profiles.py
+install -m 700 bin/send_buttons.py       ~/.local/bin/send_buttons.py
+install -m 700 bin/send_buttons.py       ~/.local/bin/gptprof_send_buttons.py
+install -m 700 bin/refresh_profiles.py   ~/.local/bin/gptprof_refresh_profiles.py
+install -m 700 bin/gptprof_autoswitch.py ~/.local/bin/gptprof_autoswitch.py
 
 # Add quick_commands to config.yaml (see above)
 
@@ -186,19 +172,19 @@ bash ~/gptprof-hermes/tests/smoke.sh
 ## Security Notes
 
 - Zero secrets in this repo — all tokens are local to the user's machine
-- OAuth client ID (`app_EMoamEEZ73f0CkXaXp7hrann`) is public OpenAI application metadata
+- Bootstrap profile files and `auth.json` must remain local and mode `0600`
 - Run `bash tests/smoke.sh` to confirm no tokens were accidentally committed
 
 ## Upstream
 
-Built on top of [evgyur/gptprof-public](https://github.com/evgyur/gptprof-public) — the sanitized public version of the profile manager CLI (`codex-profile-manager.py`).
+The card and usage concepts originated in [evgyur/gptprof-public](https://github.com/evgyur/gptprof-public). Hermes runtime state and token rotation use the upstream CredentialPool implementation.
 
 ## Output Contract
 
 When this skill is invoked, return one of:
 
 - a rendered Telegram profile card from `bin/send_buttons.py`;
-- a concise status/autoswitch result from `bin/codex-profile-manager.py` or `bin/gptprof_autoswitch.py`;
+- a concise refresh/autoswitch result from `bin/refresh_profiles.py` or `bin/gptprof_autoswitch.py`;
 - a setup/configuration checklist that keeps all OAuth tokens and Telegram tokens outside git.
 
 Never print `access_token`, `refresh_token`, Telegram bot tokens, or raw `auth.json` contents in chat output.
@@ -215,7 +201,7 @@ Before publishing changes:
 
 ## Done Criteria
 
-- [ ] Runtime scripts are portable and configured by env vars (`HERMES_AUTH`, `HERMES_HCP`, `GPTPROF_CHAT_ID`).
+- [ ] Runtime scripts use canonical `$HERMES_HOME` auth/config state and portable env overrides only for non-canonical inputs (`HERMES_HCP`, `GPTPROF_CHAT_ID`).
 - [ ] Public docs describe a generic install, not a private deployment.
 - [ ] Smoke tests include both syntax checks and public-hygiene checks.
 - [ ] Repository has no committed OAuth tokens, bot tokens, private keys, personal chat IDs, or private host paths.

@@ -1,123 +1,139 @@
 #!/usr/bin/env python3
-"""
-Local Hermes gptprof token refresher.
-
-Keeps Codex OAuth profiles alive without depending on OpenClaw as a canonical token source.
-Safe to run from systemd/cron; writes no secrets to stdout.
-"""
+"""Refresh imported gptprof credentials through Hermes CredentialPool."""
 from __future__ import annotations
 
 import argparse
-import asyncio
-import contextlib
-import fcntl
+import base64
+import datetime as dt
+import json
 import os
-import sys
-import time
+import threading
 from pathlib import Path
 from typing import Any
 
-parser = argparse.ArgumentParser(description="Refresh Hermes gptprof Codex OAuth profiles")
-parser.add_argument("--force", action="store_true", help="refresh even when access tokens are not near expiry")
-parser.add_argument("--json", action="store_true", help="emit machine-readable status JSON")
-args = parser.parse_args()
-
-# Must be set before importing send_buttons: it reads these envs at import time.
-os.environ.setdefault("GPTPROF_INTEL64_OPENCLAW_SYNC", "0")
-os.environ.setdefault("GPTPROF_ACCESS_REFRESH_SKEW", str(48 * 60 * 60))
-if args.force:
-    os.environ["GPTPROF_FORCE_REFRESH"] = "1"
-
-import aiohttp  # noqa: E402
-
-from send_buttons import (  # noqa: E402
-    PROFILES,
-    HCP_DIR,
-    USAGE_TIMEOUT,
-    access_token_exp,
-    refresh_profile_token,
-    save_profile,
-    sync_active_auth,
-    token_expiry_date,
-    load_profiles,
-)
-
-LOCK_PATH = os.getenv("GPTPROF_REFRESH_LOCK", "/tmp/gptprof-token-refresh.lock")
+from agent.credential_pool import PooledCredential, load_pool
+from hermes_cli import auth as auth_mod
 
 
-def _status(slug: str, profile: dict[str, Any], state: str, detail: str | None = None) -> dict[str, Any]:
+HERMES_HOME = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+LOCK_PATH = Path(
+    os.getenv(
+        "GPTPROF_REFRESH_LOCK",
+        str(HERMES_HOME / "run" / "gptprof-token-refresh.lock"),
+    )
+).expanduser()
+LOCK_HOLDER = threading.local()
+
+
+def _token_expiry_date(token: str) -> str:
+    try:
+        part = token.split(".")[1]
+        part += "=" * ((4 - len(part) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part.encode()))
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return "unknown"
+        return dt.datetime.fromtimestamp(exp, tz=dt.timezone.utc).date().isoformat()
+    except Exception:
+        return "unknown"
+
+
+def _status(
+    entry: PooledCredential | None,
+    state: str,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    if entry is None:
+        return {"slug": None, "state": state, "detail": detail}
     return {
-        "slug": slug,
+        "slug": entry.id.split(":", 1)[1],
         "state": state,
         "detail": detail,
-        "expires": token_expiry_date(str(profile.get("access_token") or "")),
-        "exp_ts": access_token_exp(str(profile.get("access_token") or "")),
+        "expires": _token_expiry_date(entry.access_token),
     }
 
 
-async def run() -> tuple[int, list[dict[str, Any]]]:
-    profiles = load_profiles()
+def refresh_profiles(force: bool = False) -> tuple[int, list[dict[str, Any]]]:
+    """Refresh every imported gptprof entry using the stable pool lifecycle."""
+    pool = load_pool("openai-codex")
+    entries = [
+        entry
+        for entry in pool.entries()
+        if entry.source == "manual:device_code" and entry.id.startswith("gptprof:")
+    ]
+    if not entries:
+        return 1, [
+            _status(
+                None,
+                "missing_pool",
+                "no imported gptprof credential pool entries",
+            )
+        ]
+
     results: list[dict[str, Any]] = []
     had_error = False
+    for entry in entries:
+        if entry.auth_type != "oauth" or not entry.refresh_token:
+            results.append(_status(entry, "error", "refresh token missing"))
+            had_error = True
+            continue
+        if not force and not pool._entry_needs_refresh(entry):
+            results.append(_status(entry, "fresh"))
+            continue
 
-    connector = aiohttp.TCPConnector(limit=4, force_close=True)
-    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=USAGE_TIMEOUT + 4)) as session:
-        for slug, _plan, _model in PROFILES:
-            profile = profiles.get(slug) or {}
-            if not profile:
-                results.append(_status(slug, profile, "missing_profile", f"{HCP_DIR}/{slug}.json"))
-                had_error = True
-                continue
-            if not profile.get("refresh_token"):
-                profile["_refresh_error"] = "refresh missing"
-                profile["last_refresh_error_at"] = time.time()
-                save_profile(slug, profile)
-                results.append(_status(slug, profile, "error", "refresh missing"))
-                had_error = True
-                continue
-
-            refreshed, err = await refresh_profile_token(session, slug, profile)
-            if refreshed:
-                profile["last_refresh_manager"] = "hermes-systemd-timer"
-                save_profile(slug, profile)
-                sync_active_auth(slug, profile)
-                results.append(_status(slug, profile, "refreshed"))
-            elif err:
-                profile["_refresh_error"] = err
-                profile["last_refresh_error_at"] = time.time()
-                save_profile(slug, profile)
-                results.append(_status(slug, profile, "error", err))
-                had_error = True
-            else:
-                results.append(_status(slug, profile, "fresh"))
-
+        refreshed = pool._refresh_entry(entry, force=force)
+        if refreshed is None:
+            results.append(
+                _status(entry, "error", "pool refresh failed; re-auth may be required")
+            )
+            had_error = True
+            continue
+        results.append(_status(refreshed, "refreshed"))
     return (1 if had_error else 0), results
 
 
-def print_results(results: list[dict[str, Any]]) -> None:
-    if args.json:
-        import json
-
+def _print_results(results: list[dict[str, Any]], as_json: bool) -> None:
+    if as_json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return
     for item in results:
+        slug = item.get("slug") or "gptprof"
+        expires = f" · expires {item['expires']}" if item.get("expires") else ""
         detail = f" · {item['detail']}" if item.get("detail") else ""
-        print(f"{item['slug']}: {item['state']} · expires {item['expires']}{detail}")
+        print(f"{slug}: {item['state']}{expires}{detail}")
 
 
-def main() -> int:
-    Path(HCP_DIR).mkdir(parents=True, exist_ok=True)
-    with open(LOCK_PATH, "w", encoding="utf-8") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print("gptprof refresh already running")
-            return 0
-        exit_code, results = asyncio.run(run())
-        print_results(results)
-        with contextlib.suppress(Exception):
-            fcntl.flock(lock, fcntl.LOCK_UN)
-        return exit_code
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Refresh imported gptprof credentials through Hermes CredentialPool"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="refresh every imported gptprof entry now",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON status")
+    args = parser.parse_args(argv)
+
+    try:
+        with auth_mod._file_lock(
+            LOCK_PATH,
+            LOCK_HOLDER,
+            1.0,
+            "gptprof pool refresh already running",
+        ):
+            exit_code, results = refresh_profiles(force=args.force)
+    except TimeoutError:
+        results = [
+            {
+                "slug": None,
+                "state": "already_running",
+                "detail": "gptprof pool refresh already running",
+            }
+        ]
+        exit_code = 0
+    _print_results(results, args.json)
+    return exit_code
 
 
 if __name__ == "__main__":

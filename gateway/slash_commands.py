@@ -39,10 +39,9 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from hermes_cli.config import cfg_get, clear_model_endpoint_credentials
+from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
     atomic_json_write,
-    atomic_yaml_write,
     base_url_host_matches,
     is_truthy_value,
 )
@@ -90,58 +89,51 @@ class GatewaySlashCommandsMixin:
 
     @staticmethod
     def _session_model_config_dict(row: dict[str, Any]) -> dict[str, Any]:
-        """Return the parsed per-session runtime model_config dict.
-
-        ``sessions.billing_provider`` is an accounting bucket from the last
-        completed API call. A typed ``/model ... --provider X`` can change the
-        runtime before the next API call updates billing columns, so status and
-        resume logic must prefer the explicit runtime provider stored in
-        ``model_config`` when present.
-        """
+        """Return the parsed per-session runtime model configuration."""
         raw = row.get("model_config") if isinstance(row, dict) else None
         if isinstance(raw, dict):
             return raw
         if isinstance(raw, str) and raw.strip():
             try:
                 parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    return parsed
-            except Exception:
+                return parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
                 return {}
         return {}
 
     async def _persist_model_switch_runtime(self, session_id: str, result: Any) -> None:
-        """Persist a /model switch's runtime identity, not just model name."""
+        """Persist the complete runtime route selected by /model."""
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return
 
         async def _maybe_await(value: Any) -> Any:
-            if inspect.isawaitable(value):
-                return await value
-            return value
+            return await value if inspect.isawaitable(value) else value
 
-        model_config: dict[str, Any] = {}
         try:
             existing = await _maybe_await(session_db.get_session(session_id)) or {}
             model_config = self._session_model_config_dict(existing)
         except Exception:
             model_config = {}
-        model_config.update({
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "base_url": result.base_url,
-            "api_mode": result.api_mode,
-            "billing_provider": result.target_provider,
-            "billing_base_url": result.base_url,
-        })
+        model_config.update(
+            {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+                "billing_provider": result.target_provider,
+                "billing_base_url": result.base_url,
+            }
+        )
         try:
             if hasattr(session_db, "update_session_meta"):
-                await _maybe_await(session_db.update_session_meta(
-                    session_id,
-                    json.dumps(model_config, ensure_ascii=False),
-                    result.new_model,
-                ))
+                await _maybe_await(
+                    session_db.update_session_meta(
+                        session_id,
+                        json.dumps(model_config, ensure_ascii=False),
+                        result.new_model,
+                    )
+                )
             else:
                 await _maybe_await(session_db.update_session_model(session_id, result.new_model))
         except Exception as exc:
@@ -250,6 +242,13 @@ class GatewaySlashCommandsMixin:
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
 
+        # Clear the per-session last-resolved-model cache so the next turn
+        # reads from current config instead of falling back to a stale model
+        # after a config change (#58403).
+        _lrm = getattr(self, "_last_resolved_model", None)
+        if _lrm is not None:
+            _lrm.pop(session_key, None)
+
         # Clear session-scoped dangerous-command approvals and /yolo state.
         # /new is a conversation-boundary operation — approval state from the
         # previous conversation must not survive the reset.
@@ -285,9 +284,13 @@ class GatewaySlashCommandsMixin:
             "session_key": session_key,
         })
 
-        # Resolve session config info to surface to the user
+        # Resolve session config info to surface to the user, scoped to the
+        # profile serving this source so a multiplexed /reset //new banner
+        # reports the profile's model, not the base config's (#59003).
         try:
-            session_info = self._format_session_info()
+            session_info = await asyncio.to_thread(
+                self._reset_notice_session_info, source
+            )
         except Exception:
             session_info = ""
 
@@ -523,23 +526,17 @@ class GatewaySlashCommandsMixin:
         return output or t("gateway.kanban.no_output")
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
-        """Handle /status command with an OpenClaw-style operator snapshot.
-
-        This used to live in ``gateway.run``. Keep the richer format here now
-        that slash commands are split into this mixin; otherwise upstream
-        refactors silently regress /status back to the weak legacy output.
-        """
+        """Handle /status with a compact operator snapshot."""
         from gateway.run import (
             _AGENT_PENDING_SENTINEL,
             _format_status_count,
             _format_status_duration,
             _gateway_status_auth_label,
             _gateway_status_fallbacks,
+            _gateway_status_model_label,
             _gateway_status_model_parts,
             _gateway_status_runtime_label,
             _load_gateway_runtime_config,
-            _load_gateway_config,
-            _resolve_gateway_model,
             _read_system_uptime_seconds,
             _status_git_revision,
         )
@@ -550,35 +547,24 @@ class GatewaySlashCommandsMixin:
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         connected_platforms = [p.value for p in self.adapters.keys()]
-        # Check if there's an active agent. Keep the sentinel distinct: a
-        # starting/pending run should not be treated as a fully usable agent for
-        # model/context display, but it still occupies the session slot.
         agent = self._running_agents.get(session_key)
         is_running = agent is not None and agent is not _AGENT_PENDING_SENTINEL
-
-
         adapter = self.adapters.get(source.platform) if source else None
         queue_depth = self._queue_depth(session_key, adapter=adapter)
 
-        def _clean_str(value: Any) -> str:
-            return value.strip() if isinstance(value, str) and value.strip() else ""
-
         def _int_value(value: Any) -> int:
             try:
-                return int(value)
+                return int(value or 0)
             except (TypeError, ValueError):
                 return 0
+
+        async def _maybe_await(value: Any) -> Any:
+            return await value if inspect.isawaitable(value) else value
 
         title = None
         row: dict[str, Any] = {}
         session_db = getattr(self, "_session_db", None)
         if session_db:
-
-            async def _maybe_await(value: Any) -> Any:
-                if inspect.isawaitable(value):
-                    return await value
-                return value
-
             try:
                 title = await _maybe_await(session_db.get_session_title(session_entry.session_id))
             except Exception:
@@ -589,14 +575,13 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 row = {}
 
-        session_row = row
-        input_tokens = int(row.get("input_tokens") or 0)
-        output_tokens = int(row.get("output_tokens") or 0)
-        cache_read = int(row.get("cache_read_tokens") or 0)
-        cache_write = int(row.get("cache_write_tokens") or 0)
-        reasoning_tokens = int(row.get("reasoning_tokens") or 0)
+        input_tokens = _int_value(row.get("input_tokens"))
+        output_tokens = _int_value(row.get("output_tokens"))
+        cache_read = _int_value(row.get("cache_read_tokens"))
+        cache_write = _int_value(row.get("cache_write_tokens"))
+        reasoning_tokens = _int_value(row.get("reasoning_tokens"))
         total_tokens = input_tokens + output_tokens + cache_read + cache_write + reasoning_tokens
-        api_calls = int(row.get("api_call_count") or 0)
+        api_calls = _int_value(row.get("api_call_count"))
         cost_value = row.get("actual_cost_usd")
         if cost_value is None:
             cost_value = row.get("estimated_cost_usd")
@@ -605,17 +590,12 @@ class GatewaySlashCommandsMixin:
         except (TypeError, ValueError):
             cost = 0.0
 
-        cfg = _load_gateway_runtime_config()
+        try:
+            cfg = _load_gateway_runtime_config()
+        except Exception:
+            cfg = {}
         cfg_model, cfg_provider, cfg_base_url, cfg_context_length = _gateway_status_model_parts(cfg)
         model_config = self._session_model_config_dict(row)
-
-        # Build the displayed runtime as a coherent tuple. A /model switch
-        # persists the new provider/model/base_url in model_config before the
-        # next API call updates billing columns, while a stale billing_provider
-        # or live in-flight agent can still point at the previous runtime. Do
-        # not mix provider from one source with model from another (for example
-        # the invalid-looking ``openai-codex/glm`` after switching to
-        # ``human20-keys/glm``).
         provider = str(cfg_provider or "")
         model = str(cfg_model or "unknown")
         base_url = str(cfg_base_url or "")
@@ -639,63 +619,49 @@ class GatewaySlashCommandsMixin:
             base_url = str(override.get("base_url") or base_url)
             explicit_runtime_selected = True
 
-        # Use live/cached agent details for context/compressor stats. Only use
-        # them for the displayed provider/model when no explicit switched
-        # runtime is recorded for the session; otherwise a stale in-flight agent
-        # can clobber the just-selected runtime in /status.
-        agent = self._running_agents.get(session_key)
         if not agent or agent is _AGENT_PENDING_SENTINEL:
             cache_lock = getattr(self, "_agent_cache_lock", None)
             agent_cache = getattr(self, "_agent_cache", None)
             if cache_lock and agent_cache is not None:
-                with cache_lock:
-                    cached = agent_cache.get(session_key)
+                try:
+                    with cache_lock:
+                        cached = agent_cache.get(session_key)
                     if cached:
                         agent = cached[0]
+                except Exception:
+                    agent = None
         if agent and agent is not _AGENT_PENDING_SENTINEL and not explicit_runtime_selected:
-            agent_provider = getattr(agent, "provider", None)
-            agent_model = getattr(agent, "model", None)
-            agent_base_url = getattr(agent, "base_url", None)
-            if isinstance(agent_provider, str) and agent_provider.strip():
-                provider = agent_provider
-            if isinstance(agent_model, str) and agent_model.strip():
-                model = agent_model
-            if isinstance(agent_base_url, str) and agent_base_url.strip():
-                base_url = agent_base_url
+            provider = str(getattr(agent, "provider", None) or provider)
+            model = str(getattr(agent, "model", None) or model)
+            base_url = str(getattr(agent, "base_url", None) or base_url)
 
         context_tokens = 0
         context_length: Optional[int] = None
         compression_count = 0
         ctx = getattr(agent, "context_compressor", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
         if ctx is not None:
-            context_tokens = int(getattr(ctx, "last_prompt_tokens", 0) or 0)
-            context_length = int(getattr(ctx, "context_length", 0) or 0) or None
-            compression_count = int(getattr(ctx, "compression_count", 0) or 0)
+            context_tokens = _int_value(getattr(ctx, "last_prompt_tokens", 0))
+            context_length = _int_value(getattr(ctx, "context_length", 0)) or None
+            compression_count = _int_value(getattr(ctx, "compression_count", 0))
+        context_tokens = context_tokens or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
         if not context_tokens:
             try:
                 from agent.model_metadata import estimate_messages_tokens_rough
 
-                history_for_context = self.session_store.load_transcript(session_entry.session_id)
-                msgs = [
-                    m for m in history_for_context
-                    if m.get("role") in {"user", "assistant"} and m.get("content")
+                history = self.session_store.load_transcript(session_entry.session_id)
+                messages = [
+                    item
+                    for item in history
+                    if item.get("role") in {"user", "assistant"} and item.get("content")
                 ]
-                context_tokens = int(estimate_messages_tokens_rough(msgs)) if msgs else 0
+                context_tokens = _int_value(estimate_messages_tokens_rough(messages)) if messages else 0
             except Exception:
                 context_tokens = 0
         if not context_length:
-            try:
-                from agent.model_metadata import get_model_context_length
-
-                context_length = int(get_model_context_length(
-                    model,
-                    base_url=base_url,
-                    api_key="",
-                    config_context_length=cfg_context_length,
-                    provider=provider,
-                ))
-            except Exception:
-                context_length = cfg_context_length
+            # /status runs on the gateway event loop. Keep it read-only and
+            # non-networking; model metadata discovery can probe remote/local
+            # endpoints and belongs in agent/model-switch setup instead.
+            context_length = cfg_context_length
 
         context_pct = 0
         if context_length and context_length > 0:
@@ -740,85 +706,12 @@ class GatewaySlashCommandsMixin:
         if len(session_label) > 96:
             session_label = session_label[:93] + "..."
         title_suffix = f" · {title}" if title else ""
-
-        # Resolve model/context for cockpit-style status. Prefer the live or
-        # cached agent because it carries the actual runtime route and context
-        # compressor. Fall back to persisted SessionDB metadata plus the
-        # SessionStore's last_prompt_tokens so /status remains useful between
-        # turns without making billing/account calls.
-        status_agent = agent if is_running else None
-        if status_agent is None:
-            cache_lock = getattr(self, "_agent_cache_lock", None)
-            cache = getattr(self, "_agent_cache", None)
-            if cache_lock is not None and cache is not None:
-                try:
-                    with cache_lock:
-                        cached = cache.get(session_key)
-                    if cached:
-                        status_agent = cached[0]
-                except Exception:
-                    status_agent = None
-
-        model_name = ""
-        provider_name = ""
-        base_url = ""
-        context_used = 0
-        context_total = 0
-        if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
-            model_name = _clean_str(getattr(status_agent, "model", ""))
-            provider_name = _clean_str(getattr(status_agent, "provider", ""))
-            base_url = _clean_str(getattr(status_agent, "base_url", ""))
-            ctx = getattr(status_agent, "context_compressor", None)
-            if ctx is not None:
-                context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
-                context_total = _int_value(getattr(ctx, "context_length", 0))
-
-        model_name = model_name or _clean_str(session_row.get("model"))
-        provider_name = provider_name or _clean_str(session_row.get("billing_provider"))
-        base_url = base_url or _clean_str(session_row.get("billing_base_url"))
-        context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
-
-        user_config: dict[str, Any] = {}
-        if not model_name or not provider_name or not context_total:
-            try:
-                user_config = _load_gateway_config()
-            except Exception:
-                user_config = {}
-        if not model_name:
-            model_name = _resolve_gateway_model(user_config)
-        if not provider_name:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            if isinstance(model_cfg, dict):
-                provider_name = _clean_str(model_cfg.get("provider"))
-        if not context_total:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
-            if isinstance(configured_context, int) and configured_context > 0:
-                context_total = configured_context
-
-        model_line = ""
-        if model_name:
-            if provider_name:
-                model_line = t("gateway.status.model_provider", model=model_name, provider=provider_name)
-            else:
-                model_line = t("gateway.status.model", model=model_name)
-
-        context_line = ""
-        if context_total:
-            pct = min(100, round((context_used / context_total) * 100)) if context_total else 0
-            context_line = t(
-                "gateway.status.context",
-                used=f"{context_used:,}",
-                total=f"{context_total:,}",
-                pct=f"{pct}",
-            )
-        elif context_used:
-            context_line = t("gateway.status.context_used", used=f"{context_used:,}")
+        model_label = _gateway_status_model_label(provider, model)
 
         lines = [
             f"🪽 **Hermes {hermes_version} ({_status_git_revision()})**",
             f"⏱️ Uptime: gateway {gateway_uptime} · system {system_uptime}",
-            f"🧠 Model: {provider + '/' if provider else ''}{model} · 🔑 {auth_label}",
+            f"🧠 Model: {model_label} · 🔑 {auth_label}",
             f"🔄 Fallbacks: {_gateway_status_fallbacks(fallback_chain)}",
             f"🧮 Tokens: {_format_status_count(input_tokens)} in / {_format_status_count(output_tokens)} out · total {_format_status_count(total_tokens)} · 💵 Cost: ${cost:.4f}",
             cache_line,
@@ -829,13 +722,6 @@ class GatewaySlashCommandsMixin:
             f"🔌 Platforms: {', '.join(connected_platforms) if connected_platforms else 'none'}",
             f"🆔 Session ID: `{session_entry.session_id}` · Created: {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
         ]
-
-        if model_line:
-            lines.append(model_line)
-        if context_line:
-            lines.append(context_line)
-        lines.append(f"**Cumulative API tokens (re-sent each call):** {total_tokens:,}")
-
         if source.platform == Platform.MATRIX:
             adapter = self.adapters.get(Platform.MATRIX)
             scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
@@ -852,7 +738,6 @@ class GatewaySlashCommandsMixin:
                     session_key=self._redact_matrix_session_key(session_key),
                 ),
             ])
-
         return "\n".join(lines)
 
     @staticmethod
@@ -2306,7 +2191,7 @@ class GatewaySlashCommandsMixin:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
                 config["agent"]["system_prompt"] = ""
-                atomic_yaml_write(config_path, config)
+                atomic_config_write(config_path, config)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
             self._ephemeral_system_prompt = ""
@@ -2319,7 +2204,7 @@ class GatewaySlashCommandsMixin:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
                 config["agent"]["system_prompt"] = new_prompt
-                atomic_yaml_write(config_path, config)
+                atomic_config_write(config_path, config)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
 
@@ -2865,7 +2750,7 @@ class GatewaySlashCommandsMixin:
                         current[k] = {}
                     current = current[k]
                 current[keys[-1]] = value
-                atomic_yaml_write(config_path, user_config)
+                atomic_config_write(config_path, user_config)
                 return True
             except Exception as e:
                 logger.error("Failed to save config key %s: %s", key_path, e)
@@ -2968,7 +2853,7 @@ class GatewaySlashCommandsMixin:
                 with open(config_path, encoding="utf-8") as f:
                     user_config = yaml.safe_load(f) or {}
             user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
-            atomic_yaml_write(config_path, user_config)
+            atomic_config_write(config_path, user_config)
             # New setting must take effect next message → drop cached agent.
             self._evict_cached_agent(session_key)
 
@@ -3024,7 +2909,7 @@ class GatewaySlashCommandsMixin:
                 with open(config_path, encoding="utf-8") as f:
                     user_config = yaml.safe_load(f) or {}
             user_config.setdefault("skills", {})["write_approval"] = bool(enabled)
-            atomic_yaml_write(config_path, user_config)
+            atomic_config_write(config_path, user_config)
             # New setting must take effect next message → drop cached agent.
             self._evict_cached_agent(session_key)
 
@@ -3076,7 +2961,7 @@ class GatewaySlashCommandsMixin:
                         current[k] = {}
                     current = current[k]
                 current[keys[-1]] = value
-                atomic_yaml_write(config_path, user_config)
+                atomic_config_write(config_path, user_config)
                 return True
             except Exception as e:
                 logger.error("Failed to save config key %s: %s", key_path, e)
@@ -3173,7 +3058,7 @@ class GatewaySlashCommandsMixin:
             if platform_key not in display["platforms"] or not isinstance(display["platforms"].get(platform_key), dict):
                 display["platforms"][platform_key] = {}
             display["platforms"][platform_key]["tool_progress"] = new_mode
-            atomic_yaml_write(config_path, user_config)
+            atomic_config_write(config_path, user_config)
             return (
                 f"{descriptions[new_mode]}\n"
                 + t("gateway.verbose.saved_suffix", platform=platform_key)
@@ -3248,7 +3133,7 @@ class GatewaySlashCommandsMixin:
             if not isinstance(display.get("runtime_footer"), dict):
                 display["runtime_footer"] = {}
             display["runtime_footer"]["enabled"] = new_state
-            atomic_yaml_write(config_path, user_config)
+            atomic_config_write(config_path, user_config)
         except Exception as e:
             logger.warning("Failed to save runtime_footer.enabled: %s", e)
             return t("gateway.config_save_failed", error=e)
@@ -3353,10 +3238,14 @@ class GatewaySlashCommandsMixin:
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
 
+            # Pass the FULL transcript (tool results included) — same
+            # rationale as the session-hygiene auto-compress in
+            # gateway/run.py (#3854): filtering to user/assistant-only
+            # starves the compressor's tool-result pruning and can trip the
+            # protect-first/last early-return on short filtered histories.
             msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in {"user", "assistant"} and m.get("content")
+                m for m in history
+                if m.get("role") in {"user", "assistant", "tool"}
             ]
 
             # Boundary-aware split: only the head is summarized; the most
@@ -3842,6 +3731,13 @@ class GatewaySlashCommandsMixin:
         _pending_notes = getattr(self, "_pending_model_notes", None)
         if isinstance(_pending_notes, dict):
             _pending_notes.pop(session_key, None)
+        # Clear per-session model cache too, for the same reason — the
+        # resumed conversation must resolve from current config, not a
+        # stale value cached under this session_key before the switch
+        # (mirrors /new and the compression-exhausted auto-reset, #58403).
+        _lrm = getattr(self, "_last_resolved_model", None)
+        if isinstance(_lrm, dict):
+            _lrm.pop(session_key, None)
 
         # Evict any cached agent for this session so the next message
         # rebuilds with the correct session_id end-to-end — mirrors
@@ -3886,9 +3782,14 @@ class GatewaySlashCommandsMixin:
         source = event.source
         raw_args = event.get_command_args().strip()
         try:
-            include_all, include_unnamed, target = parse_session_listing_args(raw_args)
+            include_all, include_unnamed, target, search_query = (
+                parse_session_listing_args(raw_args)
+            )
         except ValueError as exc:
             return t("gateway.resume.parse_error", error=exc)
+
+        if search_query == "":
+            return "Usage: `/sessions search <query>`"
 
         if target:
             resume_event = dataclasses.replace(event, text=f"/resume {target}")
@@ -3908,7 +3809,10 @@ class GatewaySlashCommandsMixin:
             current_session_id=current_entry.session_id,
             include_all_sources=cross_origin,
             include_unnamed=include_unnamed,
-            limit=10,
+            search_query=search_query,
+            # Search filters at SQL level, so over-fetch before the visibility
+            # cut: origin-invisible matches would otherwise consume the page.
+            limit=50 if search_query else 10,
             exclude_sources=["tool"],
         )
         if not cross_origin:
@@ -3918,10 +3822,15 @@ class GatewaySlashCommandsMixin:
                 row for row in rows
                 if await self._resume_row_visible(source, row, allow_all=False)
             ]
+        rows = rows[:10]
+        if search_query:
+            title = f"Sessions matching “{search_query}”"
+        else:
+            title = "Sessions" if include_unnamed else "Named Sessions"
         return format_gateway_session_listing(
             rows,
             include_source=cross_origin,
-            title="Sessions" if include_unnamed else "Named Sessions",
+            title=title,
         )
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:
@@ -4556,6 +4465,9 @@ class GatewaySlashCommandsMixin:
         a definitive BLOCKED message, same as the CLI deny flow.
 
         ``/deny`` denies the oldest; ``/deny all`` denies everything.
+        ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line
+        reason that is relayed back to the agent so it can adapt instead of
+        only hearing "denied". Ported from qwibitai/nanoclaw#2832.
         """
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -4570,10 +4482,24 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.deny.stale")
             return t("gateway.deny.no_pending")
 
-        args = event.get_command_args().strip().lower()
-        resolve_all = "all" in args
+        # Parse args: a leading "all" token denies every pending command;
+        # anything after it (or the whole arg string when "all" is absent) is
+        # captured verbatim as the optional deny reason relayed to the agent.
+        raw_args = event.get_command_args().strip()
+        tokens = raw_args.split()
+        resolve_all = bool(tokens) and tokens[0].lower() == "all"
+        if resolve_all:
+            reason = raw_args[len(tokens[0]):].strip()
+        else:
+            reason = raw_args
+        # Cap to a sane one-liner; the agent only needs a short hint.
+        if reason:
+            reason = reason[:280].strip()
 
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        count = resolve_gateway_approval(
+            session_key, "deny", resolve_all=resolve_all,
+            reason=reason or None,
+        )
         if not count:
             return t("gateway.deny.no_pending")
 
@@ -4582,7 +4508,14 @@ class GatewaySlashCommandsMixin:
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
-        logger.info("User denied %d dangerous command(s) via /deny", count)
+        logger.info(
+            "User denied %d dangerous command(s) via /deny%s",
+            count, " (with reason)" if reason else "",
+        )
+        if reason:
+            if count > 1:
+                return t("gateway.deny.denied_reason_plural", count=count, reason=reason)
+            return t("gateway.deny.denied_reason_singular", reason=reason)
         if count > 1:
             return t("gateway.deny.denied_plural", count=count)
         return t("gateway.deny.denied_singular")
