@@ -75,6 +75,91 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
 
 
 @pytest.mark.asyncio
+async def test_status_command_renders_compact_operator_snapshot(monkeypatch):
+    """The Telegram status reply keeps the compact operator snapshot visible."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-rich",
+        created_at=datetime(2026, 1, 2, 3, 4),
+        updated_at=datetime(2026, 1, 2, 3, 4),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=session_entry),
+        load_transcript=AsyncMock(return_value=[]),
+    )
+    runner._session_db.get_session_title = AsyncMock(return_value=None)
+    runner._session_db.get_session = AsyncMock(
+        return_value={
+            "input_tokens": 1_200,
+            "output_tokens": 300,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 100,
+            "reasoning_tokens": 100,
+            "api_call_count": 7,
+            "actual_cost_usd": 0.1234,
+            "model_config": '{"model":"stale/model","provider":"stale-provider"}',
+        }
+    )
+    runner._session_db.get_dominant_session_model_route = AsyncMock(
+        return_value={
+            "model": "historic/model",
+            "billing_provider": "historic-provider",
+            "billing_base_url": "https://historic.example/v1",
+        }
+    )
+    runner._gateway_started_at = time.time() - 3_600
+    runner._busy_input_mode = "queue"
+    runner._service_tier = "priority"
+    runner._fallback_model = [
+        {"provider": "openrouter", "model": "fallback/one"},
+        {"provider": "openai", "model": "fallback/two"},
+    ]
+    runner._resolve_session_reasoning_config = lambda **_: {"effort": "high"}
+    runner._running_agents[session_entry.session_key] = SimpleNamespace(
+        model="openai/gpt-test",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+            compression_count=2,
+        ),
+    )
+
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: {
+        "model": {
+            "default": "openai/gpt-test",
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "context_length": 100_000,
+        },
+        "agent": {"reasoning_effort": "medium"},
+    })
+    monkeypatch.setattr("gateway.run._read_system_uptime_seconds", lambda: 90_061)
+    monkeypatch.setattr("gateway.run._status_git_revision", lambda: "abc123")
+
+    result = await runner._handle_status_command(_make_event("/status"))
+
+    assert "🪶 **Hermes " in result and "(abc123)" in result
+    assert "⏱️ Uptime: gateway 1h 0m · system 1d 1h" in result
+    assert "🧠 Model: openai/gpt-test · 🔑 configured" in result
+    assert "🔄 Fallbacks: openrouter/fallback/one → openai/fallback/two" in result
+    assert "🧮 Tokens: 1.2k in / 300 out · total 2.3k · 💵 Cost: $0.1234" in result
+    assert "🗄️ Cache: 33% hit · 600 cached, 100 new" in result
+    assert "📚 Context: 12.3k/100k (12%) · 🧹 Compactions: 2" in result
+    assert "🧵 Session: `agent:main:telegram:dm:c1`" in result
+    assert "⚙️ Execution: direct · Runtime: openai · Think: high · Fast: on" in result
+    assert "🪢 Queue: queue (depth 0) · Agent: running ⚡ · Calls: 7" in result
+    assert "🔌 Platforms: telegram" in result
+    assert "🆔 Session ID: `sess-rich`" in result
+
+
+@pytest.mark.asyncio
 async def test_status_command_reads_token_totals_from_session_db():
     """Regression test for #17158: /status must source token totals from the
     SQLite SessionDB (where run_agent.py persists them) and sum all component
@@ -100,7 +185,7 @@ async def test_status_command_reads_token_totals_from_session_db():
     result = await runner._handle_message(_make_event("/status"))
 
     # 1000 + 250 + 500 + 100 + 50 = 1,900
-    assert "**Lifetime tokens billed:** 1,900" in result
+    assert "🧮 Tokens: 1k in / 250 out · total 1.9k" in result
 
 
 @pytest.mark.asyncio
@@ -136,9 +221,9 @@ async def test_status_command_includes_live_agent_model_and_context():
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Model:** `openai/gpt-test` (openai)" in result
-    assert "**Context:** 12,345 / 100,000 (12%)" in result
-    assert "**Lifetime tokens billed:** 1,250" in result
+    assert "🧠 Model: openai/gpt-test" in result
+    assert "📚 Context: 12.3k/100k (12%)" in result
+    assert "🧮 Tokens: 1k in / 250 out · total 1.2k" in result
 
 
 @pytest.mark.asyncio
@@ -180,11 +265,15 @@ async def test_status_command_uses_dominant_persisted_model_route(tmp_path):
             provider="nous",
             base_url="https://inference-api.nousresearch.com/v1/",
         )
+        runner._session_model_config_dict = lambda _: {
+            "model": "stale/model",
+            "provider": "stale-provider",
+        }
 
         result = await runner._handle_message(_make_event("/status"))
 
-        assert "**Model:** `z-ai/glm-5.2` (nvidia)" in result
-        assert "**Model:** `z-ai/glm-5.2` (nous)" not in result
+        assert "🧠 Model: z-ai/glm-5.2 (nvidia)" in result
+        assert "🧠 Model: z-ai/glm-5.2 (nous)" not in result
     finally:
         db.close()
 

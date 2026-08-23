@@ -3874,6 +3874,16 @@ def _gateway_status_model_parts(config: dict) -> tuple[str, str, str, Optional[i
     )
 
 
+def _gateway_status_model_label(provider: str, model: str) -> str:
+    provider = (provider or "").strip()
+    model = (model or "unknown").strip()
+    if not provider or model.startswith(f"{provider}/"):
+        return model
+    if "/" in model:
+        return f"{model} ({provider})"
+    return f"{provider}/{model}"
+
+
 def _gateway_status_auth_label(provider: str) -> str:
     provider_key = (provider or "").strip().lower()
     if provider_key == "openai-codex":
@@ -4617,6 +4627,7 @@ class TurnRunner:
             _progress_adapter = None
         if (
             getattr(_progress_adapter, "supports_code_blocks", False)
+            and ctx.terminal_progress_format != "inline"
             and tool_name == "terminal"
             and isinstance(args, dict)
             and isinstance(args.get("command"), str)
@@ -28510,6 +28521,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        terminal_progress_format = str(
+            resolve_display_setting(
+                user_config, platform_key, "terminal_progress_format", "code_block"
+            )
+            or "code_block"
+        ).strip().lower()
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         _generic_status_recent: List[str] = []
         _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
@@ -28688,6 +28705,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _thinking_enabled=_thinking_enabled,
             progress_mode=progress_mode,
             progress_grouping=progress_grouping,
+            terminal_progress_format=terminal_progress_format,
             tool_progress_enabled=tool_progress_enabled,
             progress_queue=progress_queue,
             log_queue=log_queue,

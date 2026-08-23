@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -127,6 +128,20 @@ class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
+
+    @staticmethod
+    def _session_model_config_dict(row: dict[str, Any]) -> dict[str, Any]:
+        """Return the parsed per-session runtime model configuration."""
+        raw = row.get("model_config") if isinstance(row, dict) else None
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                return {}
+        return {}
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -574,179 +589,253 @@ class GatewaySlashCommandsMixin:
         return output or t("gateway.kanban.no_output")
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
-        """Handle /status command."""
-        from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model
+        """Handle /status with a compact operator snapshot."""
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL,
+            _format_status_count,
+            _format_status_duration,
+            _gateway_status_auth_label,
+            _gateway_status_fallbacks,
+            _gateway_status_model_label,
+            _gateway_status_model_parts,
+            _gateway_status_runtime_label,
+            _load_gateway_runtime_config,
+            _read_system_uptime_seconds,
+            _status_git_revision,
+        )
+        from hermes_cli import __version__ as hermes_version
+        from hermes_cli.fallback_config import get_fallback_chain
 
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
-
-        connected_platforms = [p.value for p in self.adapters.keys()]
-
-        # Check if there's an active agent. Keep the sentinel distinct: a
-        # starting/pending run should not be treated as a fully usable agent for
-        # model/context display, but it still occupies the session slot.
         session_key = session_entry.session_key
+        connected_platforms = [p.value for p in self.adapters.keys()]
         agent = self._running_agents.get(session_key)
         is_running = agent is not None and agent is not _AGENT_PENDING_SENTINEL
-
-        # Count pending /queue follow-ups (slot + overflow).
         adapter = self.adapters.get(source.platform) if source else None
         queue_depth = self._queue_depth(session_key, adapter=adapter)
 
-        def _clean_str(value: Any) -> str:
-            return value.strip() if isinstance(value, str) and value.strip() else ""
-
         def _int_value(value: Any) -> int:
             try:
-                return int(value)
+                return int(value or 0)
             except (TypeError, ValueError):
                 return 0
 
         title = None
-        session_row: dict[str, Any] = {}
-        # Pull token totals from the SQLite session DB rather than the
-        # in-memory SessionStore.  The agent's per-turn token deltas are
-        # persisted into sessions_db (run_agent.py), not into SessionEntry,
-        # so session_entry.total_tokens is always 0.  SessionDB is the
-        # single source of truth; reading it here keeps /status accurate
-        # without duplicating token writes into two stores.
-        db_total_tokens = 0
+        row: dict[str, Any] = {}
         persisted_route: dict[str, Any] = {}
-        if self._session_db:
+        if getattr(self, "_session_db", None):
             try:
                 title = await self._session_db.get_session_title(session_entry.session_id)
             except Exception:
                 title = None
             try:
-                row = await self._session_db.get_session(session_entry.session_id)
-                if isinstance(row, dict):
-                    session_row = row
-                    db_total_tokens = (
-                        _int_value(row.get("input_tokens"))
-                        + _int_value(row.get("output_tokens"))
-                        + _int_value(row.get("cache_read_tokens"))
-                        + _int_value(row.get("cache_write_tokens"))
-                        + _int_value(row.get("reasoning_tokens"))
-                    )
+                loaded = await self._session_db.get_session(session_entry.session_id)
+                row = loaded if isinstance(loaded, dict) else {}
             except Exception:
-                db_total_tokens = 0
+                row = {}
             try:
-                route = await self._session_db.get_dominant_session_model_route(
+                loaded_route = await self._session_db.get_dominant_session_model_route(
                     session_entry.session_id
                 )
-                if isinstance(route, dict):
-                    persisted_route = route
+                persisted_route = loaded_route if isinstance(loaded_route, dict) else {}
             except Exception:
                 persisted_route = {}
 
-        # Resolve model/context for cockpit-style status. Prefer the live or
-        # cached agent because it carries the actual runtime route and context
-        # compressor. Fall back to persisted SessionDB metadata plus the
-        # SessionStore's last_prompt_tokens so /status remains useful between
-        # turns without making billing/account calls.
-        status_agent = agent if is_running else None
-        if status_agent is None:
+        input_tokens = _int_value(row.get("input_tokens"))
+        output_tokens = _int_value(row.get("output_tokens"))
+        cache_read = _int_value(row.get("cache_read_tokens"))
+        cache_write = _int_value(row.get("cache_write_tokens"))
+        reasoning_tokens = _int_value(row.get("reasoning_tokens"))
+        total_tokens = input_tokens + output_tokens + cache_read + cache_write + reasoning_tokens
+        api_calls = _int_value(row.get("api_call_count"))
+        cost_value = row.get("actual_cost_usd")
+        if cost_value is None:
+            cost_value = row.get("estimated_cost_usd")
+        try:
+            cost = float(cost_value or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+
+        try:
+            cfg = _load_gateway_runtime_config()
+        except Exception:
+            cfg = {}
+        cfg_model, cfg_provider, cfg_base_url, cfg_context_length = (
+            _gateway_status_model_parts(cfg)
+        )
+        model_config = self._session_model_config_dict(row)
+        provider = str(cfg_provider or "")
+        model = str(cfg_model or "unknown")
+        base_url = str(cfg_base_url or "")
+
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
             cache_lock = getattr(self, "_agent_cache_lock", None)
-            cache = getattr(self, "_agent_cache", None)
-            if cache_lock is not None and cache is not None:
+            agent_cache = getattr(self, "_agent_cache", None)
+            if cache_lock and agent_cache is not None:
                 try:
                     with cache_lock:
-                        cached = cache.get(session_key)
+                        cached = agent_cache.get(session_key)
                     if cached:
-                        status_agent = cached[0]
+                        agent = cached[0]
                 except Exception:
-                    status_agent = None
+                    agent = None
 
-        model_name = ""
-        provider_name = ""
-        base_url = ""
-        route_resolved = False
-        context_used = 0
-        context_total = 0
-        if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
-            live_model = _clean_str(getattr(status_agent, "model", ""))
-            live_provider = _clean_str(getattr(status_agent, "provider", ""))
-            if live_model and live_provider:
-                model_name = live_model
-                provider_name = live_provider
-                base_url = _clean_str(getattr(status_agent, "base_url", ""))
-                route_resolved = True
-            ctx = getattr(status_agent, "context_compressor", None)
-            if ctx is not None:
-                context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
-                context_total = _int_value(getattr(ctx, "context_length", 0))
+        overrides = getattr(self, "_session_model_overrides", {}) or {}
+        override = overrides.get(session_key, {}) if isinstance(overrides, dict) else {}
+        live_model = str(getattr(agent, "model", None) or "") if agent is not _AGENT_PENDING_SENTINEL else ""
+        live_provider = str(getattr(agent, "provider", None) or "") if agent is not _AGENT_PENDING_SENTINEL else ""
 
-        persisted_model = _clean_str(persisted_route.get("model"))
-        persisted_provider = _clean_str(persisted_route.get("billing_provider"))
-        if not route_resolved and persisted_model and persisted_provider:
-            model_name = persisted_model
-            provider_name = persisted_provider
-            base_url = _clean_str(persisted_route.get("billing_base_url"))
-            route_resolved = True
-        if not route_resolved:
-            model_name = _clean_str(session_row.get("model"))
-            provider_name = _clean_str(session_row.get("billing_provider"))
-            base_url = _clean_str(session_row.get("billing_base_url"))
-        context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
+        if override.get("provider") and override.get("model"):
+            provider = str(override["provider"])
+            model = str(override["model"])
+            base_url = str(override.get("base_url") or base_url)
+        elif live_provider and live_model:
+            provider = live_provider
+            model = live_model
+            base_url = str(getattr(agent, "base_url", None) or base_url)
+        elif persisted_route.get("billing_provider") and persisted_route.get("model"):
+            provider = str(persisted_route["billing_provider"])
+            model = str(persisted_route["model"])
+            base_url = str(persisted_route.get("billing_base_url") or base_url)
+        elif model_config.get("provider") and model_config.get("model"):
+            provider = str(model_config["provider"])
+            model = str(model_config["model"])
+            base_url = str(model_config.get("base_url") or base_url)
+        elif row.get("billing_provider") and row.get("model"):
+            provider = str(row["billing_provider"])
+            model = str(row["model"])
+            base_url = str(row.get("billing_base_url") or base_url)
 
-        user_config: dict[str, Any] = {}
-        if not model_name or not provider_name or not context_total:
+        context_tokens = 0
+        context_length: Optional[int] = None
+        compression_count = 0
+        ctx = (
+            getattr(agent, "context_compressor", None)
+            if agent and agent is not _AGENT_PENDING_SENTINEL
+            else None
+        )
+        if ctx is not None:
+            context_tokens = _int_value(getattr(ctx, "last_prompt_tokens", 0))
+            context_length = _int_value(getattr(ctx, "context_length", 0)) or None
+            compression_count = _int_value(getattr(ctx, "compression_count", 0))
+        context_tokens = context_tokens or _int_value(
+            getattr(session_entry, "last_prompt_tokens", 0)
+        )
+        if not context_tokens:
             try:
-                user_config = _load_gateway_config()
+                from agent.model_metadata import estimate_messages_tokens_rough
+
+                history = await self.async_session_store.load_transcript(
+                    session_entry.session_id
+                )
+                messages = [
+                    item
+                    for item in history
+                    if item.get("role") in {"user", "assistant"} and item.get("content")
+                ]
+                context_tokens = (
+                    _int_value(estimate_messages_tokens_rough(messages)) if messages else 0
+                )
             except Exception:
-                user_config = {}
-        if not model_name:
-            model_name = _resolve_gateway_model(user_config)
-        if not provider_name:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            if isinstance(model_cfg, dict):
-                provider_name = _clean_str(model_cfg.get("provider"))
-        if not context_total:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
-            if isinstance(configured_context, int) and configured_context > 0:
-                context_total = configured_context
+                context_tokens = 0
+        if not context_length:
+            # Keep /status read-only; metadata discovery may probe endpoints.
+            context_length = cfg_context_length
 
-        model_line = ""
-        if model_name:
-            if provider_name:
-                model_line = t("gateway.status.model_provider", model=model_name, provider=provider_name)
-            else:
-                model_line = t("gateway.status.model", model=model_name)
-
-        context_line = ""
-        if context_total:
-            pct = min(100, round((context_used / context_total) * 100)) if context_total else 0
-            context_line = t(
-                "gateway.status.context",
-                used=f"{context_used:,}",
-                total=f"{context_total:,}",
-                pct=f"{pct}",
+        context_pct = 0
+        if context_length and context_length > 0:
+            context_pct = max(
+                0,
+                min(100, round((context_tokens / context_length) * 100)),
             )
-        elif context_used:
-            context_line = t("gateway.status.context_used", used=f"{context_used:,}")
+
+        gateway_started = getattr(self, "_gateway_started_at", None)
+        gateway_uptime = (
+            _format_status_duration(time.time() - gateway_started)
+            if gateway_started
+            else "unknown"
+        )
+        system_uptime_seconds = _read_system_uptime_seconds()
+        system_uptime = (
+            _format_status_duration(system_uptime_seconds)
+            if system_uptime_seconds is not None
+            else "unknown"
+        )
+
+        cache_total = cache_read + input_tokens
+        cache_hit_pct = (
+            round((cache_read / cache_total) * 100)
+            if cache_total > 0 and cache_read
+            else 0
+        )
+        cache_line = (
+            f"🗄️ Cache: {cache_hit_pct}% hit · {_format_status_count(cache_read)} cached, "
+            f"{_format_status_count(cache_write)} new"
+            if cache_read or cache_write
+            else "🗄️ Cache: n/a"
+        )
+
+        fallback_chain = getattr(self, "_fallback_model", None) or get_fallback_chain(cfg)
+        reason_cfg = (
+            self._resolve_session_reasoning_config(
+                source=source,
+                session_key=session_key,
+                model=model,
+            )
+            or {}
+        )
+        think = str(
+            reason_cfg.get("effort")
+            or cfg_get(cfg, "agent", "reasoning_effort", default="")
+            or "medium"
+        )
+        fast_on = "on" if getattr(self, "_service_tier", None) else "off"
+        runtime_label = _gateway_status_runtime_label(provider, base_url)
+        auth_label = _gateway_status_auth_label(provider)
+        queue_mode = getattr(self, "_busy_input_mode", "interrupt") or "interrupt"
+
+        try:
+            now = datetime.now(tz=session_entry.updated_at.tzinfo)
+            updated_delta = max(0, int((now - session_entry.updated_at).total_seconds()))
+        except Exception:
+            updated_delta = 0
+        if updated_delta < 5:
+            updated_text = "just now"
+        elif updated_delta < 60:
+            updated_text = f"{updated_delta}s ago"
+        else:
+            updated_text = f"{_format_status_duration(updated_delta)} ago"
+
+        session_label = session_key
+        if source.platform == Platform.MATRIX:
+            session_label = self._redact_matrix_session_key(session_key)
+        if len(session_label) > 96:
+            session_label = session_label[:93] + "..."
+        title_suffix = f" · {title}" if title else ""
+        model_label = _gateway_status_model_label(provider, model)
 
         lines = [
-            t("gateway.status.header"),
-            "",
-            t("gateway.status.session_id", session_id=session_entry.session_id),
+            f"🪶 **Hermes {hermes_version} ({_status_git_revision()})**",
+            f"⏱️ Uptime: gateway {gateway_uptime} · system {system_uptime}",
+            f"🧠 Model: {model_label} · 🔑 {auth_label}",
+            f"🔄 Fallbacks: {_gateway_status_fallbacks(fallback_chain)}",
+            f"🧮 Tokens: {_format_status_count(input_tokens)} in / "
+            f"{_format_status_count(output_tokens)} out · total "
+            f"{_format_status_count(total_tokens)} · 💵 Cost: ${cost:.4f}",
+            cache_line,
+            f"📚 Context: {_format_status_count(context_tokens)}/"
+            f"{_format_status_count(context_length or 0)} ({context_pct}%) · "
+            f"🧹 Compactions: {compression_count}",
+            f"🧵 Session: `{session_label}` • updated {updated_text}{title_suffix}",
+            f"⚙️ Execution: direct · Runtime: {runtime_label} · "
+            f"Think: {think} · Fast: {fast_on}",
+            f"🪢 Queue: {queue_mode} (depth {queue_depth}) · "
+            f"Agent: {'running ⚡' if is_running else 'idle'} · Calls: {api_calls}",
+            f"🔌 Platforms: {', '.join(connected_platforms) if connected_platforms else 'none'}",
+            f"🆔 Session ID: `{session_entry.session_id}` · Created: "
+            f"{session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
         ]
-        if title:
-            lines.append(t("gateway.status.title", title=title))
-        lines.extend([
-            t("gateway.status.created", timestamp=session_entry.created_at.strftime('%Y-%m-%d %H:%M')),
-            t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime('%Y-%m-%d %H:%M')),
-        ])
-        if model_line:
-            lines.append(model_line)
-        if context_line:
-            lines.append(context_line)
-        lines.extend([
-            t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
-            t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
-        ])
-        if queue_depth:
-            lines.append(t("gateway.status.queued", count=queue_depth))
         if source.platform == Platform.MATRIX:
             adapter = self.adapters.get(Platform.MATRIX)
             scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
@@ -763,11 +852,6 @@ class GatewaySlashCommandsMixin:
                     session_key=self._redact_matrix_session_key(session_key),
                 ),
             ])
-        lines.extend([
-            "",
-            t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
-        ])
-
         return "\n".join(lines)
 
     @staticmethod
