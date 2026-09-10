@@ -1144,6 +1144,36 @@ class TestForceReloadSymmetry:
         assert elapsed < 5.0
         hold.set()
 
+    def test_parallel_callback_overlap_is_not_treated_as_timeout(self, monkeypatch, caplog):
+        """Ordinary concurrent post-tool events must each reach the observer."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+        hold = threading.Event()
+        both_started = threading.Event()
+        starts = []
+
+        def blocker(**_kwargs):
+            starts.append(1)
+            if len(starts) == 2:
+                both_started.set()
+            hold.wait(timeout=10.0)
+            return "done"
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [blocker]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(mgr.invoke_hook, "post_tool_call")
+            second = pool.submit(mgr.invoke_hook, "post_tool_call")
+            assert both_started.wait(timeout=0.5)
+            hold.set()
+            assert first.result(timeout=2.0) == ["done"]
+            assert second.result(timeout=2.0) == ["done"]
+
+        assert "skipped after previous timeout" not in caplog.text
+
     def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
         """Timed-out pre_tool_call must return a block directive, not allow."""
         import time

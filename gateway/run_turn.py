@@ -3643,9 +3643,9 @@ class GatewayTurnMixin:
                     ok=("Edited streamed message %s for session %s to include plugin-transformed content.", _sc.message_id, _sk),
                     fail_result=None, fail_exc="Failed to edit streamed message for session %s: %s",
                 )
-        elif _sc is not None:
-            # DUPLICATE-RISK DIAGNOSTIC: a stream consumer existed but suppression did NOT fire; log the
-            # decision inputs ("signal never set" vs "ack-pending race").
+        elif _sc is not None and bool(getattr(_sc, "_stream_ledger", "")):
+            # DUPLICATE-RISK DIAGNOSTIC: actual stream content existed but suppression did NOT fire;
+            # an idle consumer leaves final delivery to the normal send path by design.
             logger.warning(
                 "Normal final-send NOT suppressed despite active stream consumer for session %s: "
                 "streamed=%s previewed=%s content_delivered=%s transformed=%s final_len=%d — "

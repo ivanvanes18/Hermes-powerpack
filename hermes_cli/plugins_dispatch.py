@@ -148,6 +148,8 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
 
 
 class PluginDispatchMixin:
+    _hook_running_callbacks: Dict[tuple, Dict[object, bool]]
+
     @staticmethod
     def _invoke_hook_callback(callback: Callable, payload: Dict[str, Any]) -> Any:
         """Invoke a hook while withholding additive fields from narrow legacy callbacks."""
@@ -209,15 +211,21 @@ class PluginDispatchMixin:
         token = object()
         with self._hook_timeout_lock:
             suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
-            running = callback_key in self._hook_running_callbacks
-            if (suppressed_until is not None and suppressed_until > time.monotonic()) or running:
+            running = self._hook_running_callbacks.get(callback_key, {})
+            timed_out_running = any(running.values())
+            allow_overlap = hook_name == "post_tool_call"
+            if (
+                (suppressed_until is not None and suppressed_until > time.monotonic())
+                or timed_out_running
+                or (running and not allow_overlap)
+            ):
                 logger.warning(
                     "Hook '%s' callback %s skipped after previous "
                     "timeout or while still running", hook_name, callback_name)
                 return _HOOK_SKIPPED
             if suppressed_until is not None:
                 self._hook_timeout_suppressed_until.pop(callback_key, None)
-            self._hook_running_callbacks[callback_key] = token
+            self._hook_running_callbacks.setdefault(callback_key, {})[token] = False
 
         context = contextvars.copy_context()
         done = threading.Event()
@@ -226,7 +234,10 @@ class PluginDispatchMixin:
 
         def _release_token() -> None:
             with self._hook_timeout_lock:
-                if self._hook_running_callbacks.get(callback_key) is token:
+                tokens = self._hook_running_callbacks.get(callback_key)
+                if tokens is not None:
+                    tokens.pop(token, None)
+                if not tokens:
                     self._hook_running_callbacks.pop(callback_key, None)
 
         def _runner() -> None:
@@ -249,6 +260,9 @@ class PluginDispatchMixin:
             return _HOOK_SKIPPED
         if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
             with self._hook_timeout_lock:
+                tokens = self._hook_running_callbacks.get(callback_key)
+                if tokens is not None and token in tokens:
+                    tokens[token] = True
                 # See #6622.
                 self._hook_timeout_suppressed_until[callback_key] = (
                     time.monotonic() + self._hook_timeout_suppression_seconds)

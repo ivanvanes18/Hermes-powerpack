@@ -18,7 +18,9 @@ Three invariants:
 """
 
 import asyncio
+import logging
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -219,6 +221,35 @@ class TestFinalAdoptionGuards:
         await task
         assert adapter.send_calls == [], "no-stream turn must not deliver via the consumer"
         assert adapter.draft_calls == []
+
+    @pytest.mark.asyncio
+    async def test_no_stream_turn_does_not_emit_duplicate_risk_warning(self, caplog):
+        """An idle consumer leaves the normal final send as the sole delivery owner."""
+        from gateway.run import GatewayRunner
+
+        adapter = _make_draft_adapter()
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=1, cursor="",
+        )
+        sc = GatewayStreamConsumer(adapter, "D1", cfg)
+        task = asyncio.create_task(sc.run())
+        sc.finish("the final answer from a non-streaming turn")
+        await task
+        response = {"final_response": "the final answer from a non-streaming turn"}
+        turn_ctx = SimpleNamespace(
+            stream_consumer_holder=[sc],
+            source=SimpleNamespace(chat_id="D1"),
+            session_key="session-1",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="gateway.run"):
+            await GatewayRunner._run_agent_mark_streamed_delivery(
+                object.__new__(GatewayRunner), response, cast(Any, turn_ctx)
+            )
+
+        assert "already_sent" not in response
+        assert "Normal final-send NOT suppressed" not in caplog.text
 
 
 class TestQueuedLaneReconcile:
