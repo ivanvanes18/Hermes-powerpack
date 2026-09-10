@@ -904,6 +904,21 @@ def _target_thread_id() -> int | None:
     return thread_id if thread_id > 1 else None
 
 
+def build_control_rows(button_cls: Any) -> list[list[Any]]:
+    """Stable operator controls, including callbacks used by already-sent cards."""
+    return [
+        [
+            button_cls("🔄 Usage", callback_data="gptprof:refresh"),
+            button_cls("🔁 Autoswitch", callback_data="gptprof:autoswitch"),
+        ],
+        [
+            button_cls("➕ New auth", callback_data="gptprof:new_auth"),
+            button_cls("✅ Check auth", callback_data="gptprof:check_auth"),
+        ],
+        [button_cls("⤴ Back to Pi route", callback_data="gptprof:pi_route")],
+    ]
+
+
 async def main() -> None:
     from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -980,10 +995,7 @@ async def main() -> None:
         profile_buttons.append(InlineKeyboardButton(btn_text, callback_data=callback))
 
     rows = [profile_buttons[i:i + 2] for i in range(0, len(profile_buttons), 2)]
-    rows.append([
-        InlineKeyboardButton("🔄 Usage", callback_data="gptprof:refresh"),
-        InlineKeyboardButton("🔁 Autoswitch", callback_data="gptprof:autoswitch"),
-    ])
+    rows.extend(build_control_rows(InlineKeyboardButton))
     keyboard = InlineKeyboardMarkup(rows)
 
     send_kwargs = {"chat_id": int(_target_chat_id()), "text": text,

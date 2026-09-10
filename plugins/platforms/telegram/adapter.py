@@ -110,6 +110,33 @@ def _gptprof_callback_env(query: Any) -> Dict[str, str]:
     return env
 
 
+_GPTPROF_DEVICE_VERIFY_URL = "https://auth.openai.com/codex/device"
+_GPTPROF_USER_CODE_RE = re.compile(r"[A-Z0-9]{4,12}(?:-[A-Z0-9]{4,12}){0,2}")
+
+
+def _gptprof_refresh_completed(stdout: bytes) -> bool:
+    """Accept only a completed canonical refresh; lock contention is not success."""
+    try:
+        rows = json.loads(stdout.decode("utf-8"))
+    except Exception:
+        return False
+    return bool(rows) and isinstance(rows, list) and all(
+        isinstance(row, dict) and row.get("state") in {"refreshed", "fresh"}
+        for row in rows
+    )
+
+
+def _gptprof_device_flow_fields(payload: Dict[str, Any]) -> tuple[str, str] | None:
+    url = payload.get("verificationUrl")
+    code = payload.get("userCode")
+    if url != _GPTPROF_DEVICE_VERIFY_URL or not isinstance(code, str):
+        return None
+    code = code.strip().upper()
+    if not _GPTPROF_USER_CODE_RE.fullmatch(code):
+        return None
+    return url, code
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -4804,7 +4831,9 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         timeout: float,
         extra_env: dict[str, str] | None = None,
-    ) -> None:
+        answer_success: bool = True,
+        success_check: Any = None,
+    ) -> bool:
         """Run a local helper without exposing stdout, stderr, or exception text."""
         proc = None
         try:
@@ -4817,10 +4846,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
-            await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            if proc.returncode == 0:
-                await query.answer(text=success_text)
-                return
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode == 0 and (success_check is None or success_check(stdout)):
+                if answer_success:
+                    await query.answer(text=success_text)
+                return True
         except asyncio.TimeoutError:
             if proc is not None:
                 with contextlib.suppress(Exception):
@@ -4835,6 +4865,65 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
         await query.answer(text="gptprof helper failed")
+        return False
+
+    async def _run_gptprof_profile_action(self, query: Any, action: str) -> None:
+        """Run one authorized legacy card action without exposing helper output."""
+        command_map = {
+            "new_auth": "device-start",
+            "check_auth": "device-check",
+            "pi_route": "apply-pi-route",
+        }
+        command = command_map.get(action)
+        if command is None:
+            await query.answer(text="Invalid gptprof callback.", show_alert=True)
+            return
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                os.path.expanduser("~/.local/bin/codex-profile-manager.py"),
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_gptprof_callback_env(query),
+            )
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+            payload = json.loads(stdout.decode("utf-8")) if proc.returncode == 0 else {}
+            if not isinstance(payload, dict):
+                payload = {}
+            device_fields = _gptprof_device_flow_fields(payload)
+            if action == "new_auth" and payload.get("ok") and device_fields:
+                url, code = device_fields
+                text = f"Open {url} and enter code {code}"
+            elif action == "check_auth" and payload.get("pending"):
+                if device_fields:
+                    url, code = device_fields
+                    text = f"Still pending: {url} code {code}"
+                else:
+                    text = "gptprof action failed"
+            elif action == "check_auth" and payload.get("ok"):
+                text = "Authorization complete."
+            elif action == "pi_route" and payload.get("ok"):
+                text = "Pi route applied. Send /new for a clean session."
+            else:
+                text = "gptprof action failed"
+            await query.answer(text=text, show_alert=True)
+            return
+        except asyncio.TimeoutError:
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    await proc.communicate()
+        except asyncio.CancelledError:
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    await asyncio.shield(proc.communicate())
+            raise
+        except Exception:
+            pass
+        await query.answer(text="gptprof action failed", show_alert=True)
 
     async def _handle_gptprof_callback(self, query, data: str) -> None:
         """Handle public gptprof inline-button callbacks.
@@ -4864,13 +4953,21 @@ class TelegramAdapter(BasePlatformAdapter):
         parts = data.split(":")
         action = parts[1] if len(parts) > 1 else ""
         if action in {"refresh", "card"}:
-            await self._run_gptprof_helper(
+            refreshed = await self._run_gptprof_helper(
                 query,
-                [sys.executable, os.path.expanduser("~/.local/bin/gptprof_send_buttons.py")],
-                "gptprof card refreshed",
-                timeout=30,
-                extra_env={"GPTPROF_FORCE_REFRESH": "1"},
+                [sys.executable, os.path.expanduser("~/.local/bin/gptprof_refresh_profiles.py"), "--force", "--json"],
+                "",
+                timeout=45,
+                answer_success=False,
+                success_check=_gptprof_refresh_completed,
             )
+            if refreshed:
+                await self._run_gptprof_helper(
+                    query,
+                    [sys.executable, os.path.expanduser("~/.local/bin/gptprof_send_buttons.py")],
+                    "gptprof card refreshed",
+                    timeout=30,
+                )
             return
         if action == "autoswitch":
             await self._run_gptprof_helper(
@@ -4879,6 +4976,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 "gptprof autoswitch complete",
                 timeout=30,
             )
+            return
+        if action in {"new_auth", "check_auth", "pi_route"}:
+            await self._run_gptprof_profile_action(query, action)
             return
         if len(parts) < 3:
             await query.answer(text="Invalid gptprof callback.")
