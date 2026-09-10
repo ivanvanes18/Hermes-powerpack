@@ -21,6 +21,7 @@ class TurnContext:
     _thinking_enabled: bool = False
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
+    terminal_progress_format: str = "code_block"
     tool_progress_enabled: bool = False
     progress_queue: Any = None
     log_queue: Any = None

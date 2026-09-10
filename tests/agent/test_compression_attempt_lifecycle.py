@@ -229,6 +229,23 @@ class TestDurableAttemptBackoff:
 
 
 class TestSupersessionDiscardsLateResults:
+    def test_status_formatter_failure_releases_durable_lease_and_fence(self, tmp_path: Path):
+        db, agent = _build_agent(tmp_path, "FORMATTER_FAILURE")
+        fence = CompressionCommitFence()
+
+        with patch(
+            "agent.conversation_compression.automatic_compaction_status_message",
+            side_effect=RuntimeError("broken context-engine formatter"),
+        ), pytest.raises(RuntimeError, match="broken context-engine formatter"):
+            compress_context(
+                agent, _messages(), "sys", approx_tokens=500_000,
+                commit_fence=fence,
+            )
+
+        assert db.get_compression_lock_holder("FORMATTER_FAILURE") is None
+        assert fence.begin_lock_setup() is True
+        fence.finish_lock_setup()
+
     def test_superseded_attempt_candidate_never_commits(self, tmp_path: Path):
         db, agent = _build_agent(tmp_path, "SUPERSEDE")
         live = _messages()

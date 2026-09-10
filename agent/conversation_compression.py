@@ -3519,7 +3519,8 @@ def _route_codex_compaction(
 
 
 def _announce_compression_start(
-    agent: Any, *, message_count: int, approx_tokens: Optional[int], focus_topic: Optional[str], force: bool
+    agent: Any, *, message_count: int, approx_tokens: Optional[int], focus_topic: Optional[str], force: bool,
+    lifecycle: Optional[_CompactionLifecycle] = None,
 ) -> _CompactionLifecycle:
     """Log the attempt, emit the (engine-customisable) compacting status, return the lifecycle."""
     logger.info(
@@ -3534,7 +3535,10 @@ def _announce_compression_start(
         )
     if status:
         agent._emit_status(status)
-    return _CompactionLifecycle(agent, bool(status))
+    if lifecycle is None:
+        return _CompactionLifecycle(agent, bool(status))
+    lifecycle.status_emitted = bool(status)
+    return lifecycle
 
 
 def compress_context(
@@ -3595,19 +3599,29 @@ def compress_context(
     # In-place keeps the SAME session_id (no rotation/child/renumber/re-sync). A
     # missing attribute must default True, not rotation, which can wedge sessions.
     in_place = bool(getattr(agent, "compression_in_place", True))
-    lifecycle = _announce_compression_start(
-        agent, message_count=_pre_msg_count, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force
-    )
+    # Acquire the per-session lease before announcing compression. A competing
+    # automatic/manual path must not show a second "Compacting context" phase
+    # when it will immediately sit out on the durable lock.
+    lifecycle = _CompactionLifecycle(agent, False)
     lease, _abort_prompt = _acquire_compression_lease(
         agent, commit_fence=commit_fence, lifecycle=lifecycle, system_message=system_message,
         approx_tokens=approx_tokens, attempt_started_at=attempt.started_at,
     )
     if lease is None:
         return messages, _abort_prompt
-
     # Publish the holder-qualified release hook before a timeout can win the
     # fence. If no durable lock was acquired there is no hook to publish.
-    lease.finish_lock_setup()
+    try:
+        lease.finish_lock_setup()
+        _announce_compression_start(
+            agent, message_count=_pre_msg_count, approx_tokens=approx_tokens,
+            focus_topic=focus_topic, force=force, lifecycle=lifecycle,
+        )
+    except BaseException:
+        # Context-engine formatters are plugin code. A broken formatter must
+        # not strand this session's durable lease or compression fence.
+        lease.release()
+        raise
     _adopted = _adopt_if_parent_rotated(agent, lease, messages, system_message)
     if _adopted is not None:
         return _adopted

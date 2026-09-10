@@ -203,7 +203,9 @@ class TurnRunner:
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
         """
         if not (
-            getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal" and isinstance(args, dict)
+            getattr(adapter, "supports_code_blocks", False)
+            and self._ctx.terminal_progress_format != "inline"
+            and tool_name == "terminal" and isinstance(args, dict)
             and isinstance(args.get("command"), str) and args["command"].strip()
         ):
             return None, None

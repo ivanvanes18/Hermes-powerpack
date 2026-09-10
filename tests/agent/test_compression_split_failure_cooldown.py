@@ -54,3 +54,4 @@ def test_manual_compress_bypasses_cooldown():
     )
 
     assert result is not None
+    agent_mock._emit_status.assert_not_called()

@@ -9,6 +9,8 @@ import hashlib
 import os
 import re
 import time
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
@@ -42,6 +44,113 @@ def _n(obj, attr: str):
 
 def _fmt(n) -> str:
     return f"{n:,}"
+
+
+def _format_status_count(value: Any) -> str:
+    """Compact operator-facing counts (1.4k, 2.1m)."""
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        number = 0.0
+    sign = "-" if number < 0 else ""
+    number = abs(number)
+    if number >= 1_000_000:
+        rendered = f"{number / 1_000_000:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{rendered}m"
+    if number >= 1_000:
+        rendered = f"{number / 1_000:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{rendered}k"
+    return f"{sign}{int(number):,}"
+
+
+def _format_status_duration(seconds: Any) -> str:
+    try:
+        total = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        total = 0
+    days, rem = divmod(total, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _read_system_uptime_seconds() -> float | None:
+    try:
+        return float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except Exception:
+        return None
+
+
+def _status_git_revision() -> str:
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        return str(get_code_identity().get("sha") or "unknown")[:10]
+    except Exception:
+        return "unknown"
+
+
+def _gateway_status_model_label(provider: str, model: str) -> str:
+    provider = (provider or "").strip()
+    model = (model or "unknown").strip()
+    if not provider or model.startswith(f"{provider}/"):
+        return model
+    if "/" in model:
+        return f"{model} ({provider})"
+    return f"{provider}/{model}"
+
+
+def _gateway_status_auth_label(provider: str) -> str:
+    provider_key = (provider or "").strip().lower()
+    if provider_key == "openai-codex":
+        return "oauth (codex-cli)"
+    try:
+        from providers import get_provider_profile
+
+        overlay = get_provider_profile(provider_key)
+        auth_type = str(getattr(overlay, "auth_type", "") or "") if overlay else ""
+        if auth_type.startswith("oauth"):
+            return "oauth"
+        if auth_type == "api_key":
+            return "api key"
+        if auth_type:
+            return auth_type.replace("_", " ")
+    except Exception:
+        pass
+    return "configured" if provider_key else "unknown"
+
+
+def _gateway_status_runtime_label(provider: str, base_url: str) -> str:
+    provider_key = (provider or "").strip().lower()
+    return {
+        "openai-codex": "OpenAI Codex",
+        "openrouter": "OpenRouter",
+        "minimax": "MiniMax",
+    }.get(provider_key, provider_key or ("custom" if base_url else "unknown"))
+
+
+def _gateway_status_fallbacks(chain: Any) -> str:
+    if not chain:
+        return "none"
+    if not isinstance(chain, list):
+        chain = [chain]
+    labels: list[str] = []
+    for item in chain[:4]:
+        if isinstance(item, dict):
+            provider = str(item.get("provider") or "").strip()
+            model = str(item.get("model") or item.get("default") or "").strip()
+            labels.append(f"{provider}/{model}" if provider and model else provider or model or "fallback")
+        else:
+            labels.append(str(item))
+    if len(chain) > 4:
+        labels.append(f"+{len(chain) - 4}")
+    return " → ".join(filter(None, labels)) or "none"
 
 
 def _pct(used, total) -> float:  # clamped occupancy percentage; 0 for an unknown window
@@ -214,8 +323,11 @@ class GatewayStatusCommandsMixin:
     """Read-only gateway introspection commands: /status, /context, /usage, /agents, /insights, /topup."""
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
-        """Handle /status command."""
+        """Handle /status with the compact Powerpack operator snapshot."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from hermes_cli import __version__ as hermes_version
+        from hermes_cli.fallback_config import get_fallback_chain
+
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
@@ -232,34 +344,105 @@ class GatewayStatusCommandsMixin:
         # Prefer the live or cached agent (actual runtime route + context compressor); fall back
         # to SessionDB metadata + last_prompt_tokens so /status stays useful between turns.
         status_agent = agent if is_running else self._cached_agent_for(session_key)
-        model_name, provider_name, context_used, context_total = _status_model_route(
-            status_agent, persisted_route, session_row, session_entry
-        )
+        with self._profile_scope_for_source(source):
+            model_name, provider_name, context_used, context_total = _status_model_route(
+                status_agent, persisted_route, session_row, session_entry
+            )
+        overrides = getattr(self, "_session_model_overrides", {}) or {}
+        override = overrides.get(session_key, {}) if isinstance(overrides, Mapping) else {}
+        if override.get("model") and override.get("provider"):
+            model_name = _clean_str(override.get("model"))
+            provider_name = _clean_str(override.get("provider"))
+        context_estimated = False
+        if not context_used:
+            try:
+                history = await self.async_session_store.load_transcript(session_entry.session_id)
+                context_used, _ = _transcript_estimate(history)
+                context_estimated = bool(context_used)
+            except Exception:
+                context_used = 0
 
-        stamp = "%Y-%m-%d %H:%M"
-        lines = [t("gateway.status.header"), "",
-                 t("gateway.status.session_id", session_id=session_entry.session_id)]
-        if title:
-            lines.append(t("gateway.status.title", title=title))
-        lines += [t("gateway.status.created", timestamp=session_entry.created_at.strftime(stamp)),
-                  t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime(stamp))]
-        if model_name and provider_name:
-            lines.append(t("gateway.status.model_provider", model=model_name, provider=provider_name))
-        elif model_name:
-            lines.append(t("gateway.status.model", model=model_name))
-        from agent.context_breakdown import context_display_source
-        mark = "~" if context_display_source(getattr(status_agent, "context_compressor", None)) != "provider_usage" else ""
-        if context_total:
-            pct = min(100, round((context_used / context_total) * 100))
-            lines.append(t("gateway.status.context", used=mark + _fmt(context_used), total=_fmt(context_total),
-                           pct=f"{mark}{pct}"))
-        elif context_used:
-            lines.append(t("gateway.status.context_used", used=mark + _fmt(context_used)))
-        state = t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")
-        lines += [t("gateway.status.tokens", tokens=_fmt(db_total_tokens)),
-                  t("gateway.status.agent_running", state=state)]
-        if queue_depth:
-            lines.append(t("gateway.status.queued", count=queue_depth))
+        input_tokens = _int_value(session_row.get("input_tokens"))
+        output_tokens = _int_value(session_row.get("output_tokens"))
+        cache_read = _int_value(session_row.get("cache_read_tokens"))
+        cache_write = _int_value(session_row.get("cache_write_tokens"))
+        api_calls = _int_value(session_row.get("api_call_count"))
+        cost_value = session_row.get("actual_cost_usd")
+        if cost_value is None:
+            cost_value = session_row.get("estimated_cost_usd")
+        try:
+            cost = float(cost_value or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+
+        from gateway.run import _load_gateway_runtime_config
+
+        with self._profile_scope_for_source(source):
+            cfg = _quiet_sync(_load_gateway_runtime_config, {})
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
+            fallback_chain = get_fallback_chain(cfg)
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                fallback_chain = getattr(self, "_fallback_model", None) or fallback_chain
+            reason_cfg = self._resolve_session_reasoning_config(
+                source=source, session_key=session_key, model=model_name
+            ) or {}
+            fast_on = "on" if self._resolve_session_service_tier(source=source, session_key=session_key) else "off"
+        base_url = _clean_str(override.get("base_url"))
+        base_url = base_url or (_clean_str(getattr(status_agent, "base_url", "")) if status_agent else "")
+        base_url = base_url or _clean_str(persisted_route.get("billing_base_url")) or _clean_str(model_cfg.get("base_url"))
+        think = str(reason_cfg.get("effort") or (cfg.get("agent", {}) or {}).get("reasoning_effort") or "medium")
+        runtime_label = _gateway_status_runtime_label(provider_name, base_url)
+        queue_mode = self._effective_busy_input_mode(source)
+        compression_count = _int_value(
+            getattr(getattr(status_agent, "context_compressor", None), "compression_count", 0)
+        )
+        context_pct = min(100, round(context_used / context_total * 100)) if context_total else 0
+        cache_total = cache_read + input_tokens
+        cache_hit_pct = round(cache_read / cache_total * 100) if cache_total and cache_read else 0
+        cache_line = (
+            f"🗄️ Cache: {cache_hit_pct}% hit · {_format_status_count(cache_read)} cached, "
+            f"{_format_status_count(cache_write)} new"
+            if cache_read or cache_write else "🗄️ Cache: n/a"
+        )
+        gateway_started = getattr(self, "_gateway_started_at", 0.0)
+        gateway_uptime = _format_status_duration(time.time() - gateway_started) if gateway_started else "unknown"
+        system_seconds = _read_system_uptime_seconds()
+        system_uptime = _format_status_duration(system_seconds) if system_seconds is not None else "unknown"
+        try:
+            updated_delta = max(0, int(time.time() - session_entry.updated_at.timestamp()))
+        except Exception:
+            updated_delta = 0
+        if updated_delta < 5:
+            updated_text = "just now"
+        elif updated_delta < 60:
+            updated_text = f"{updated_delta}s ago"
+        else:
+            updated_text = f"{_format_status_duration(updated_delta)} ago"
+        session_label = session_key
+        if source.platform == Platform.MATRIX:
+            session_label = self._redact_matrix_session_key(session_key)
+        if len(session_label) > 96:
+            session_label = session_label[:93] + "..."
+        title_suffix = f" · {title}" if title else ""
+
+        lines = [
+            f"🪶 **Hermes {hermes_version} ({_status_git_revision()})**",
+            f"⏱️ Uptime: gateway {gateway_uptime} · system {system_uptime}",
+            f"🧠 Model: {_gateway_status_model_label(provider_name, model_name)} · 🔑 {_gateway_status_auth_label(provider_name)}",
+            f"🔄 Fallbacks: {_gateway_status_fallbacks(fallback_chain)}",
+            f"🧮 Tokens: {_format_status_count(input_tokens)} in / {_format_status_count(output_tokens)} out · "
+            f"total {_format_status_count(db_total_tokens)} · 💵 Cost: ${cost:.4f}",
+            cache_line,
+            f"📚 Context: {'~' if context_estimated else ''}{_format_status_count(context_used)}/"
+            f"{_format_status_count(context_total)} ({'~' if context_estimated else ''}{context_pct}%) · "
+            f"🧹 Compactions: {compression_count}",
+            f"🧵 Session: `{session_label}` • updated {updated_text}{title_suffix}",
+            f"⚙️ Execution: direct · Runtime: {runtime_label} · Think: {think} · Fast: {fast_on}",
+            f"🪢 Queue: {queue_mode} (depth {queue_depth}) · Agent: {'running ⚡' if is_running else 'idle'} · Calls: {api_calls}",
+            f"🔌 Platforms: {', '.join(p.value for p in self.adapters) if self.adapters else 'none'}",
+            f"🆔 Session ID: `{session_entry.session_id}` · Created: {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
+        ]
         if source.platform == Platform.MATRIX:
             scope = getattr(self.adapters.get(Platform.MATRIX), "_matrix_session_scope",
                             os.getenv("MATRIX_SESSION_SCOPE", "auto"))
@@ -273,7 +456,6 @@ class GatewayStatusCommandsMixin:
                 t("gateway.status.matrix_scope_key",
                   session_key=self._redact_matrix_session_key(session_key)),
             ]
-        lines += ["", t("gateway.status.platforms", platforms=', '.join(p.value for p in self.adapters))]
         return "\n".join(lines)
 
     async def _status_session_db_facts(self, session_id: str):

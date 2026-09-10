@@ -1,6 +1,7 @@
 from hermes_state import AsyncSessionDB, SessionDB
 """Tests for gateway /status behavior and token persistence."""
 
+from contextlib import contextmanager
 from datetime import datetime
 import time
 from types import SimpleNamespace
@@ -75,6 +76,69 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
 
 
 @pytest.mark.asyncio
+async def test_status_command_renders_powerpack_operator_snapshot(monkeypatch):
+    """The migrated gateway keeps the Powerpack /status operator snapshot."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-rich",
+        created_at=datetime(2026, 1, 2, 3, 4),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._session_db._db.get_session.return_value = {
+        "input_tokens": 1_200,
+        "output_tokens": 300,
+        "cache_read_tokens": 600,
+        "cache_write_tokens": 100,
+        "reasoning_tokens": 100,
+        "api_call_count": 7,
+        "actual_cost_usd": 0.1234,
+    }
+    runner._session_db._db.get_dominant_session_model_route.return_value = {
+        "model": "historic/model",
+        "billing_provider": "historic-provider",
+        "billing_base_url": "https://historic.example/v1",
+    }
+    runner._gateway_started_at = time.time() - 3_600
+    runner._busy_input_mode = "queue"
+    runner._service_tier = "priority"
+    runner._resolve_session_service_tier = lambda *_, **__: "priority"
+    runner._fallback_model = [
+        {"provider": "openrouter", "model": "fallback/one"},
+        {"provider": "openai", "model": "fallback/two"},
+    ]
+    runner._resolve_session_reasoning_config = lambda **_: {"effort": "high"}
+    runner._running_agents[session_entry.session_key] = SimpleNamespace(
+        model="openai/gpt-test",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+            compression_count=2,
+        ),
+    )
+    monkeypatch.setattr("gateway.slash_commands_status._read_system_uptime_seconds", lambda: 90_061)
+    monkeypatch.setattr("gateway.slash_commands_status._status_git_revision", lambda: "abc123")
+
+    result = await runner._handle_status_command(_make_event("/status"))
+
+    assert "🪶 **Hermes " in result and "(abc123)" in result
+    assert "⏱️ Uptime: gateway 1h 0m · system 1d 1h" in result
+    assert "🧠 Model: openai/gpt-test · 🔑 configured" in result
+    assert "🔄 Fallbacks: openrouter/fallback/one → openai/fallback/two" in result
+    assert "🧮 Tokens: 1.2k in / 300 out · total 2.3k · 💵 Cost: $0.1234" in result
+    assert "🗄️ Cache: 33% hit · 600 cached, 100 new" in result
+    assert "📚 Context: 12.3k/100k (12%) · 🧹 Compactions: 2" in result
+    assert "⚙️ Execution: direct · Runtime: openai · Think: high · Fast: on" in result
+    assert "🪢 Queue: queue (depth 0) · Agent: running ⚡ · Calls: 7" in result
+    assert "🔌 Platforms: telegram" in result
+    assert "🆔 Session ID: `sess-rich`" in result
+
+
+@pytest.mark.asyncio
 async def test_status_command_reads_token_totals_from_session_db():
     """Regression test for #17158: /status must source token totals from the
     SQLite SessionDB (where run_agent.py persists them) and sum all component
@@ -100,7 +164,7 @@ async def test_status_command_reads_token_totals_from_session_db():
     result = await runner._handle_message(_make_event("/status"))
 
     # 1000 + 250 + 500 + 100 + 50 = 1,900
-    assert "**Lifetime tokens billed:** 1,900" in result
+    assert "🧮 Tokens: 1k in / 250 out · total 1.9k" in result
 
 
 @pytest.mark.asyncio
@@ -136,9 +200,119 @@ async def test_status_command_includes_live_agent_model_and_context():
 
     result = await runner._handle_message(_make_event("/status"))
 
-    assert "**Model:** `openai/gpt-test` (openai)" in result
-    assert "**Context:** 12,345 / 100,000 (12%)" in result
-    assert "**Lifetime tokens billed:** 1,250" in result
+    assert "🧠 Model: openai/gpt-test" in result
+    assert "📚 Context: 12.3k/100k (12%)" in result
+    assert "🧮 Tokens: 1k in / 250 out · total 1.2k" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_prefers_session_model_override_without_cached_agent():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-override",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._session_model_overrides = {
+        session_entry.session_key: {
+            "model": "gpt-new",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex/",
+        }
+    }
+    runner._session_db._db.get_dominant_session_model_route.return_value = {
+        "model": "historic/model",
+        "billing_provider": "historic-provider",
+    }
+
+    result = await runner._handle_status_command(_make_event("/status"))
+
+    assert "🧠 Model: openai-codex/gpt-new" in result
+    assert "historic/model" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_estimates_context_for_nonresident_legacy_session(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-legacy",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        last_prompt_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner.session_store.load_transcript.return_value = [
+        {"role": "user", "content": "legacy context " * 200},
+        {"role": "assistant", "content": "preserved answer " * 200},
+    ]
+    cfg = {
+        "model": {
+            "default": "openai/gpt-test",
+            "provider": "openai",
+            "context_length": 100_000,
+        }
+    }
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: cfg)
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: cfg)
+
+    result = await runner._handle_status_command(_make_event("/status"))
+
+    context_line = next(line for line in result.splitlines() if line.startswith("📚 Context:"))
+    assert context_line.startswith("📚 Context: ~")
+    assert "/100k (~" in context_line
+
+
+@pytest.mark.asyncio
+async def test_status_command_resolves_profile_scoped_runtime_settings(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-profile",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.config.multiplex_profiles = True
+    runner._fallback_model = [{"provider": "wrong", "model": "global"}]
+    runner._effective_busy_input_mode = lambda source: "steer"
+    in_profile_scope = False
+
+    @contextmanager
+    def profile_scope(_source):
+        nonlocal in_profile_scope
+        in_profile_scope = True
+        try:
+            yield
+        finally:
+            in_profile_scope = False
+
+    runtime_cfg = {
+        "model": {"default": "profile/model", "provider": "profile", "context_length": 131_072},
+        "fallback_model": [{"provider": "profile", "model": "fallback"}],
+    }
+
+    def load_runtime_config():
+        assert in_profile_scope
+        return runtime_cfg
+
+    runner._profile_scope_for_source = profile_scope
+    monkeypatch.setattr("gateway.run._load_gateway_config", load_runtime_config)
+    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", load_runtime_config)
+    event = _make_event("/status")
+    event.source.profile = "milo"
+
+    result = await runner._handle_status_command(event)
+
+    assert "🧠 Model: profile/model" in result
+    assert "🔄 Fallbacks: profile/fallback" in result
+    assert "wrong/global" not in result
+    assert "🪢 Queue: steer" in result
 
 
 @pytest.mark.asyncio
@@ -183,8 +357,8 @@ async def test_status_command_uses_dominant_persisted_model_route(tmp_path):
 
         result = await runner._handle_message(_make_event("/status"))
 
-        assert "**Model:** `z-ai/glm-5.2` (nvidia)" in result
-        assert "**Model:** `z-ai/glm-5.2` (nous)" not in result
+        assert "🧠 Model: z-ai/glm-5.2 (nvidia)" in result
+        assert "🧠 Model: z-ai/glm-5.2 (nous)" not in result
     finally:
         db.close()
 
