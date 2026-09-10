@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import pytest
 from pathlib import Path
@@ -157,6 +158,75 @@ class TestTakeCheckpoint:
         # Never snapshot the filesystem root or the user's home.
         assert mgr.ensure_checkpoint("/", "root") is False
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
+
+    def test_hermes_cache_is_not_checkpointed(self, mgr, checkpoint_base, tmp_path, monkeypatch):
+        """Generated caches under $HERMES_HOME/cache are disposable and can be large
+        enough for `git add` to time out and strand the shadow index lock."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cache = tmp_path / "cache" / "terminal-output"
+        cache.mkdir(parents=True)
+        (cache / "generated.log").write_text("generated\n")
+
+        assert mgr.ensure_checkpoint(str(cache), "generated cache") is False
+        assert not _store_path(checkpoint_base).exists()
+
+    def test_cache_exclusion_follows_the_active_profile_scope(
+        self, mgr, checkpoint_base, tmp_path, monkeypatch,
+    ):
+        """Under a multiplexed gateway ``get_hermes_home()`` is context-local, so the
+        exclusion must track the profile running the turn — not the default profile whose
+        path ``CHECKPOINT_BASE`` froze at import time."""
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        from tools.checkpoint_manager import _is_volatile_root
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default-home"))
+        scoped_cache = tmp_path / "profile-home" / "cache" / "terminal-output"
+        scoped_cache.mkdir(parents=True)
+        (scoped_cache / "generated.log").write_text("generated\n")
+
+        # Outside the profile scope this path belongs to no active cache root.
+        assert _is_volatile_root(scoped_cache) is False
+
+        token = set_hermes_home_override(tmp_path / "profile-home")
+        try:
+            assert _is_volatile_root(scoped_cache) is True
+            assert mgr.ensure_checkpoint(str(scoped_cache), "scoped cache") is False
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_home_discovery_failure_does_not_disable_projects(self, mgr, work_dir, monkeypatch):
+        """An unresolvable Hermes home must never widen into "skip everything"."""
+        import hermes_constants
+
+        monkeypatch.setattr(
+            hermes_constants, "get_hermes_home",
+            lambda: (_ for _ in ()).throw(RuntimeError("no home")),
+        )
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.get_hermes_home",
+            lambda: (_ for _ in ()).throw(RuntimeError("no home")),
+        )
+
+        assert mgr.ensure_checkpoint(str(work_dir), "normal project") is True
+
+    def test_system_temp_root_is_not_checkpointed(self, mgr, checkpoint_base, monkeypatch):
+        temp_root = checkpoint_base.parent / "tmp-root"
+        temp_root.mkdir()
+        (temp_root / "generated.txt").write_text("generated\n")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_root))
+
+        assert mgr.ensure_checkpoint(str(temp_root), "system temp") is False
+        assert not _store_path(checkpoint_base).exists()
+
+    def test_temp_root_discovery_failure_does_not_disable_projects(self, mgr, work_dir, monkeypatch):
+        """An unresolvable temp root must never widen into "skip everything"."""
+        monkeypatch.setattr(
+            tempfile, "gettempdir",
+            lambda: (_ for _ in ()).throw(FileNotFoundError("no temp dir")),
+        )
+
+        assert mgr.ensure_checkpoint(str(work_dir), "normal project") is True
 
     def test_new_turn_resets_dedup_but_needs_changes(self, mgr, work_dir):
         assert mgr.ensure_checkpoint(str(work_dir), "turn 1") is True

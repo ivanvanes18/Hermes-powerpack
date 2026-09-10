@@ -754,7 +754,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when the persisted runtime-identity lines are stale."""
+    """Return False when runtime identity or mandatory prompt policy is stale."""
+
+    # A prompt persisted before the scope-owner lock existed would otherwise be reused verbatim
+    # forever, leaving long-lived tool-capable sessions permanently without a mandatory policy.
+    # Rebuilding costs exactly one prefix-cache break, once per session.
+    if getattr(agent, "valid_tool_names", None):
+        from agent.scope_owner_policy import scope_ownership_guidance
+
+        if scope_ownership_guidance() not in prompt:
+            return False
 
     identity, runtime_marker, runtime = prompt.rpartition(f"\n\n{RUNTIME_ENVIRONMENT_HEADING}\n\n")
     # Legacy prose may quote the heading, but only the new renderer ends in this boundary.

@@ -363,6 +363,63 @@ def _corrupt_btree_index(db_path: Path, index_name: str) -> None:
     raw.close()
 
 
+class _RecordingProbeConnection(sqlite3.Connection):
+    """Record the statements used by the bounded Doctor health probe."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.statements = []
+
+    def execute(self, sql, parameters=()):
+        normalized = " ".join(sql.split()).lower()
+        self.statements.append(normalized)
+        if normalized == "pragma integrity_check":
+            raise AssertionError("bounded Doctor probe ran integrity_check")
+        return super().execute(sql, parameters)
+
+
+def test_bounded_probe_skips_integrity_scan_but_runs_fts_probes(tmp_path, monkeypatch):
+    """Doctor's bounded mode checks FTS health without scanning the whole DB.
+
+    ``PRAGMA integrity_check`` is O(database size); on a multi-GB state.db it
+    dominates doctor's runtime while the FTS read/write probes — the corruption
+    class doctor actually reports — stay bounded.
+    """
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    real_connect = sqlite3.connect
+    opened = []
+
+    def recording_connect(*args, **kwargs):
+        kwargs["factory"] = _RecordingProbeConnection
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(hermes_state_repair.sqlite3, "connect", recording_connect)
+    reason = hermes_state_repair._db_opens_cleanly(db_path, full_integrity_check=False)
+
+    assert reason is None
+    assert opened
+    statements = opened[0].statements
+    assert not any("pragma integrity_check" in sql for sql in statements)
+    assert any(" match " in f" {sql} " for sql in statements)
+    assert any("insert into messages" in sql for sql in statements)
+
+
+def test_bounded_probe_does_not_weaken_the_default_full_scan(tmp_path):
+    """Opting out of the full scan must stay opt-in: the default keeps reporting
+    ordinary B-tree corruption that only ``integrity_check`` can see."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_btree_index(db_path, "idx_messages_session")
+
+    assert hermes_state_repair._db_opens_cleanly(db_path, full_integrity_check=False) is None
+    reason = hermes_state_repair._db_opens_cleanly(db_path)
+    assert reason is not None and "idx_messages_session" in reason
+
+
 def test_repair_rebuilds_stale_btree_indexes(tmp_path):
     """repair_state_db_schema repairs a REAL stale B-tree index via REINDEX.
 

@@ -19,6 +19,96 @@ logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
 
+_GPTPROF_POOL_SOURCE = "manual:device_code"
+_GPTPROF_POOL_CALLBACK_PREFIX = "pool:"
+
+
+def _gptprof_safe_slug(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9._-]{1,80}", value))
+
+
+def _gptprof_legacy_slug(item: Any) -> Optional[str]:
+    if not isinstance(item, dict):
+        return None
+    entry_id = str(item.get("id") or "")
+    if entry_id.startswith("gptprof:"):
+        return entry_id.split(":", 1)[1] or None
+    profile = item.get("profile")
+    if item.get("source") == _GPTPROF_POOL_SOURCE and isinstance(profile, str):
+        return profile.strip() or None
+    return None
+
+
+def _gptprof_pool_entry_slug(item: Any) -> Optional[str]:
+    legacy_slug = _gptprof_legacy_slug(item)
+    if legacy_slug is not None:
+        return legacy_slug
+    if not isinstance(item, dict) or item.get("source") != _GPTPROF_POOL_SOURCE:
+        return None
+    entry_id = str(item.get("id") or "").strip()
+    return f"{_GPTPROF_POOL_CALLBACK_PREFIX}{entry_id}" if entry_id else None
+
+
+def _gptprof_pool_entry_matches(pool: Any, slug: str) -> List[Dict[str, Any]]:
+    if not isinstance(pool, list):
+        return []
+    if slug.startswith(_GPTPROF_POOL_CALLBACK_PREFIX):
+        entry_id = slug[len(_GPTPROF_POOL_CALLBACK_PREFIX):]
+        return [
+            item for item in pool
+            if isinstance(item, dict)
+            and item.get("source") == _GPTPROF_POOL_SOURCE
+            and item.get("id") == entry_id
+        ]
+    entry_id = f"gptprof:{slug}"
+    return [
+        item for item in pool
+        if isinstance(item, dict)
+        and (
+            item.get("id") == entry_id
+            or item.get("source") == entry_id
+            or (
+                item.get("source") == _GPTPROF_POOL_SOURCE
+                and _gptprof_legacy_slug(item) == slug
+            )
+        )
+    ]
+
+
+def _gptprof_pool_entry_for_slug(pool: Any, slug: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(slug, str):
+        return None
+    if slug.startswith(_GPTPROF_POOL_CALLBACK_PREFIX):
+        entry_id = slug[len(_GPTPROF_POOL_CALLBACK_PREFIX):]
+        if not _gptprof_safe_slug(entry_id):
+            return None
+    elif not _gptprof_safe_slug(slug):
+        return None
+    matches = _gptprof_pool_entry_matches(pool, slug)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _gptprof_callback_env(query: Any) -> Dict[str, str]:
+    """Sanitized helper environment routed to the callback's exact chat/topic."""
+    from tools.environments.local import build_subprocess_env
+
+    env = build_subprocess_env()
+    for key in ("HERMES_QUICK_CHAT_ID", "HERMES_QUICK_THREAD_ID", "HERMES_QUICK_PLATFORM"):
+        env.pop(key, None)
+    message = getattr(query, "message", None)
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is not None:
+        env["HERMES_QUICK_CHAT_ID"] = str(chat_id)
+    thread_id = getattr(message, "message_thread_id", None)
+    try:
+        thread_value = int(thread_id) if thread_id is not None else 0
+    except (TypeError, ValueError):
+        thread_value = 0
+    if thread_value > 1:
+        env["HERMES_QUICK_THREAD_ID"] = str(thread_value)
+    env["HERMES_QUICK_PLATFORM"] = "telegram"
+    return env
+
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
@@ -3394,6 +3484,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 retryable=(self._looks_like_connect_timeout(e) or self._looks_like_pool_timeout(e) or not is_timeout),
                 error_kind=error_kind)
 
+    @staticmethod
+    def _status_cache_key(chat_id: Any, status_key: Any) -> tuple:
+        """Canonical ``_status_message_ids`` key.
+
+        The same chat reaches the adapter as ``-100123``, ``"-100123"`` or ``"+123"`` depending on
+        the caller, so the cache must key on the Bot API identity — the same
+        ``normalize_telegram_chat_id`` the wire calls use — or a write and its eviction land on
+        different keys and a deleted message id survives in the cache.
+        """
+        return (str(normalize_telegram_chat_id(chat_id)), str(status_key))
+
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a status message, or edit the previous one with the same ``(chat_id, status_key)``; if the
@@ -3403,7 +3504,7 @@ class TelegramAdapter(BasePlatformAdapter):
         append a fresh bubble on every call. With this method, the first call sends and the message id is
         remembered; subsequent calls with the same (chat_id, status_key) edit that same message in place.
         """
-        key = (str(chat_id), str(status_key))
+        key = self._status_cache_key(chat_id, status_key)
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
             result = await self.edit_message(chat_id, cached_id, content, finalize=True, metadata=metadata)
@@ -3650,7 +3751,19 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return False
         try:
-            await self._bot.delete_message(chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id))
+            deleted = await self._bot.delete_message(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id))
+            if not deleted:
+                return False
+            # The id is gone from Telegram; leaving it in the send_or_update_status cache
+            # would make the next status edit target a deleted message, and the fallback
+            # only fires on an edit *error* — so drop every key pointing at it. Compare on the
+            # canonical chat identity so a differently-spelled id cannot miss the eviction.
+            cache_chat_id = str(normalize_telegram_chat_id(chat_id))
+            cache_message_id = str(normalize_telegram_chat_id(message_id))
+            for key, cached_id in list(self._status_message_ids.items()):
+                if key[0] == cache_chat_id and str(normalize_telegram_chat_id(cached_id)) == cache_message_id:
+                    self._status_message_ids.pop(key, None)
             return True
         except Exception as e:
             logger.debug("[%s] Failed to delete Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))
@@ -4253,6 +4366,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 if chat_id:
                     await handler(query, data, chat_id)
                 return
+        if data.startswith("gptprof:"):
+            await self._handle_gptprof_callback(query, data)
+            return
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
@@ -4442,6 +4558,347 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("Telegram update prompt answered '%s' by user %s", answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    def _gptprof_profile_dir(self) -> _Path:
+        """Return the public gptprof profile directory for this Hermes home."""
+        try:
+            from hermes_constants import get_hermes_home
+            base = get_hermes_home()
+        except Exception:
+            base = _Path(os.path.expanduser("~/.hermes"))
+        return _Path(os.getenv("HERMES_HCP", str(base / "gptprof" / "profiles"))).expanduser()
+
+    def _gptprof_load_json(self, path: _Path, default: Any) -> Any:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+
+    def _gptprof_auth_path(self) -> _Path:
+        explicit = os.getenv("HERMES_AUTH")
+        if explicit:
+            return _Path(explicit).expanduser()
+        try:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home() / "auth.json"
+        except Exception:
+            return _Path(os.path.expanduser("~/.hermes/auth.json"))
+
+    def _gptprof_config_path(self) -> _Path:
+        explicit = os.getenv("HERMES_CONFIG")
+        if explicit:
+            return _Path(explicit).expanduser()
+        try:
+            from hermes_cli.config import get_config_path
+            return get_config_path()
+        except Exception:
+            return _Path(os.path.expanduser("~/.hermes/config.yaml"))
+
+    @staticmethod
+    def _gptprof_persist_model(model: str) -> None:
+        from hermes_cli.config import read_raw_config, save_config
+        cfg = read_raw_config() or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        raw_model = cfg.get("model")
+        if isinstance(raw_model, dict):
+            model_cfg = raw_model
+        elif isinstance(raw_model, str) and raw_model.strip():
+            model_cfg = {"default": raw_model.strip()}
+            cfg["model"] = model_cfg
+        else:
+            model_cfg = {}
+            cfg["model"] = model_cfg
+        model_cfg["default"] = model
+        model_cfg["provider"] = "openai-codex"
+        save_config(cfg, preserve_keys={("model", "default"), ("model", "provider")})
+
+    def _gptprof_switch_pool_entry(self, entry_id: str, model: str) -> "tuple[bool, str]":
+        if not _gptprof_safe_slug(entry_id):
+            return False, "Invalid credential pool entry id."
+        model = (model or "gpt-5.5").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:/+-]{1,120}", model):
+            return False, "Invalid model name."
+
+        auth_path = self._gptprof_auth_path()
+        from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+
+        with _auth_store_lock(target_path=auth_path):
+            auth = _load_auth_store(auth_path)
+            if not isinstance(auth, dict):
+                auth = {}
+            pool_root = auth.get("credential_pool")
+            pool = pool_root.get("openai-codex") if isinstance(pool_root, dict) else None
+            selected = _gptprof_pool_entry_for_slug(
+                pool, f"{_GPTPROF_POOL_CALLBACK_PREFIX}{entry_id}"
+            )
+            if selected is None:
+                return False, f"Credential pool entry `{entry_id}` is missing or ambiguous."
+            from agent.credential_pool import (
+                STATUS_DEAD,
+                STATUS_EXHAUSTED,
+                PooledCredential,
+                _exhausted_until,
+            )
+
+            access_token = selected.get("access_token")
+            refresh_token = selected.get("refresh_token")
+            if not isinstance(access_token, str) or not access_token.strip():
+                return False, f"Credential pool entry `{entry_id}` has no access token."
+            if not isinstance(refresh_token, str) or not refresh_token.strip():
+                return False, f"Credential pool entry `{entry_id}` has no refresh token."
+
+            pooled_entries = [
+                PooledCredential.from_dict("openai-codex", item)
+                for item in pool
+                if isinstance(item, dict)
+            ]
+            selected_credential = PooledCredential.from_dict("openai-codex", selected)
+            if selected_credential.last_status == STATUS_DEAD:
+                return False, f"Credential pool entry `{entry_id}` is dead."
+            if selected_credential.last_status == STATUS_EXHAUSTED:
+                sole_credential = sum(
+                    1 for item in pooled_entries if item.last_status != STATUS_DEAD
+                ) <= 1
+                exhausted_until = _exhausted_until(
+                    selected_credential, sole_credential=sole_credential
+                )
+                if exhausted_until is not None and time.time() < exhausted_until:
+                    return False, f"Credential pool entry `{entry_id}` is on cooldown."
+            for item in pool:
+                if item is selected:
+                    item["priority"] = 0
+                elif isinstance(item, dict) and item.get("priority") == 0:
+                    item["priority"] = 10
+            auth["active_provider"] = "openai-codex"
+            _save_auth_store(auth, target_path=auth_path)
+
+        try:
+            self._gptprof_persist_model(model)
+        except Exception as exc:
+            return True, f"Account `{entry_id}` activated, but config.yaml update failed: {exc}"
+        return True, f"Account `{entry_id}` activated with `{model}`. Send `/new` for a fresh session."
+
+    def _gptprof_switch_profile(self, slug: str, model: str) -> "tuple[bool, str]":
+        """Switch OpenAI-Codex OAuth auth to a public gptprof profile.
+
+        Public gptprof profile files live under ~/.hermes/gptprof/profiles/<slug>.json.
+        This handler intentionally uses env-driven generic paths; it contains no
+        operator-specific profile names, chat IDs, or host assumptions.
+        """
+        if slug.startswith(_GPTPROF_POOL_CALLBACK_PREFIX):
+            return self._gptprof_switch_pool_entry(
+                slug[len(_GPTPROF_POOL_CALLBACK_PREFIX):], model
+            )
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", slug or ""):
+            return False, "Invalid profile slug."
+        model = (model or "gpt-5.5").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:/+-]{1,120}", model):
+            return False, "Invalid model name."
+
+        profile_path = self._gptprof_profile_dir() / f"{slug}.json"
+        profile = self._gptprof_load_json(profile_path, {})
+        if not isinstance(profile, dict):
+            profile = {}
+
+        auth_path = self._gptprof_auth_path()
+        from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+
+        with _auth_store_lock(target_path=auth_path):
+            auth = _load_auth_store(auth_path)
+            pool_root = auth.setdefault("credential_pool", {})
+            if not isinstance(pool_root, dict):
+                pool_root = {}
+                auth["credential_pool"] = pool_root
+            pool = pool_root.get("openai-codex")
+            pool = pool if isinstance(pool, list) else []
+            matches = _gptprof_pool_entry_matches(pool, slug)
+            if len(matches) > 1:
+                return False, f"Profile `{slug}` is ambiguous in CredentialPool."
+
+            current = matches[0] if matches else None
+            if current is not None:
+                status = str(current.get("last_status") or "").strip().lower()
+                if status in {"dead", "exhausted"}:
+                    return False, f"Profile `{slug}` is unavailable in CredentialPool ({status})."
+                if not current.get("access_token") or not current.get("refresh_token"):
+                    return False, f"Profile `{slug}` has an incomplete CredentialPool entry."
+                selected = dict(current)
+            else:
+                gptprof_state = auth.setdefault("gptprof", {})
+                if not isinstance(gptprof_state, dict):
+                    gptprof_state = {}
+                    auth["gptprof"] = gptprof_state
+                imported = gptprof_state.setdefault("imported_profiles", {})
+                if not isinstance(imported, dict):
+                    imported = {}
+                    gptprof_state["imported_profiles"] = imported
+                if slug in imported:
+                    return False, f"Profile `{slug}` has only stale bootstrap credentials; re-authenticate it."
+                if not profile.get("access_token") or not profile.get("refresh_token"):
+                    return False, f"Profile `{slug}` is missing a complete OAuth token pair."
+                selected = {
+                    "id": f"gptprof:{slug}",
+                    "source": _GPTPROF_POOL_SOURCE,
+                    "profile": slug,
+                    "label": slug,
+                    "provider": "openai-codex",
+                    "auth_type": "oauth",
+                    "email": profile.get("email"),
+                    "plan": profile.get("plan"),
+                    "access_token": profile.get("access_token"),
+                    "refresh_token": profile.get("refresh_token"),
+                    "priority": 0,
+                    "last_status": "ok",
+                    "last_status_at": time.time(),
+                }
+                imported[slug] = {"imported": True}
+
+            selected["priority"] = 0
+            runtime_tokens = selected
+            codex = dict(auth.get("codex") or {})
+            codex.update({
+                "profile": slug,
+                "access_token": runtime_tokens.get("access_token"),
+                "refresh_token": runtime_tokens.get("refresh_token"),
+                "email": runtime_tokens.get("email"),
+                "plan": runtime_tokens.get("plan"),
+                "auth_mode": "chatgpt",
+            })
+            auth["codex"] = codex
+            auth["active_provider"] = "openai-codex"
+
+            providers = auth.setdefault("providers", {})
+            if isinstance(providers, dict):
+                provider_state = dict(providers.get("openai-codex") or {})
+                tokens = dict(provider_state.get("tokens") or {})
+                tokens.update(codex)
+                provider_state["tokens"] = tokens
+                provider_state["auth_mode"] = "chatgpt"
+                provider_state.pop("last_auth_error", None)
+                providers["openai-codex"] = provider_state
+
+            remaining = []
+            for item in pool:
+                if item is current:
+                    continue
+                if isinstance(item, dict) and item.get("priority") == 0:
+                    item = {**item, "priority": 10}
+                remaining.append(item)
+            pool_root["openai-codex"] = [selected, *remaining]
+            _save_auth_store(auth, target_path=auth_path)
+
+        # Persist the model/provider globally so a gateway restart keeps the route.
+        try:
+            self._gptprof_persist_model(model)
+        except Exception as exc:
+            return True, f"Profile `{slug}` activated, but config.yaml update failed: {exc}"
+
+        return True, f"Profile `{slug}` activated with `{model}`. Send `/new` for a fresh session."
+
+    async def _run_gptprof_helper(
+        self,
+        query: Any,
+        cmd: list[str],
+        success_text: str,
+        *,
+        timeout: float,
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
+        """Run a local helper without exposing stdout, stderr, or exception text."""
+        proc = None
+        try:
+            env = _gptprof_callback_env(query)
+            if extra_env:
+                env.update(extra_env)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode == 0:
+                await query.answer(text=success_text)
+                return
+        except asyncio.TimeoutError:
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    await proc.communicate()
+        except asyncio.CancelledError:
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    await asyncio.shield(proc.communicate())
+            raise
+        except Exception:
+            pass
+        await query.answer(text="gptprof helper failed")
+
+    async def _handle_gptprof_callback(self, query, data: str) -> None:
+        """Handle public gptprof inline-button callbacks.
+
+        Supports:
+        - gptprof:<slug>:<model>   switch profile + persist openai-codex model
+        - gptprof:pool:<id>:<model>  switch a credential-pool row + persist model
+        Other public buttons are acknowledged rather than silently doing nothing.
+        """
+        caller_id = str(getattr(getattr(query, "from_user", None), "id", ""))
+        query_message = getattr(query, "message", None)
+        query_chat_id = getattr(query_message, "chat_id", None)
+        query_chat = getattr(query_message, "chat", None)
+        query_chat_type = getattr(query_chat, "type", None)
+        query_thread_id = getattr(query_message, "message_thread_id", None)
+        query_user_name = getattr(getattr(query, "from_user", None), "first_name", None)
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use gptprof.")
+            return
+
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action in {"refresh", "card"}:
+            await self._run_gptprof_helper(
+                query,
+                [sys.executable, os.path.expanduser("~/.local/bin/gptprof_send_buttons.py")],
+                "gptprof card refreshed",
+                timeout=30,
+                extra_env={"GPTPROF_FORCE_REFRESH": "1"},
+            )
+            return
+        if action == "autoswitch":
+            await self._run_gptprof_helper(
+                query,
+                [sys.executable, os.path.expanduser("~/.local/bin/gptprof_autoswitch.py")],
+                "gptprof autoswitch complete",
+                timeout=30,
+            )
+            return
+        if len(parts) < 3:
+            await query.answer(text="Invalid gptprof callback.")
+            return
+        if action == "pool" and len(parts) >= 4:
+            slug = f"{_GPTPROF_POOL_CALLBACK_PREFIX}{parts[2]}"
+            model = ":".join(parts[3:])
+        else:
+            slug = parts[1]
+            model = ":".join(parts[2:])
+        ok, message = self._gptprof_switch_profile(slug, model)
+        try:
+            await query.edit_message_text(
+                text=("✅ " if ok else "❌ ") + _html.escape(message),
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+        await query.answer(text=("Profile switched" if ok else "Switch failed"), show_alert=not ok)
 
     # `gt:<verb>` -> (script in ~/.hermes/scripts/gmail-triage/, extra-args, success-label, is_state). The callback
     # `arg` is always the first positional arg. is_state=True keeps the keyboard tappable (sticky sender rule);

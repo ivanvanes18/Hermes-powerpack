@@ -777,6 +777,22 @@ def _has_binary_magic(data: bytes) -> bool:
     return data.startswith(_BINARY_MAGICS)
 
 
+def _sqlite_lock_domain(path: Path) -> Optional[Path]:
+    """The database whose POSIX locks *path* shares, or None when it cannot be resolved.
+
+    ``state.db-wal`` / ``-shm`` / ``-journal`` are sidecars of ``state.db``; protecting the
+    sidecar path alone would leave the owning database's locks exposed.
+    """
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    for suffix in ("-wal", "-shm", "-journal"):
+        if resolved.name.endswith(suffix) and len(resolved.name) > len(suffix):
+            return resolved.with_name(resolved.name[: -len(suffix)])
+    return resolved
+
+
 def _read_referenced_script(
     path: Path, *, max_bytes: Optional[int] = None
 ) -> tuple[Optional[str], bool]:
@@ -787,11 +803,38 @@ def _read_referenced_script(
     placeholder's ``open()`` can hang preflight. Lexical check: direct paths; resolved: symlinks.
     ``max_bytes`` lowers the per-file cap to what the calling walk can still afford.
 
+    The shell tokenizer also sees paths embedded in Python heredocs, so this walk can reach a live
+    ``state.db``. A raw ``open()``/``close()`` of an already-open SQLite file cancels *every* POSIX
+    advisory lock this process holds on that inode, so the read runs under the official
+    ``hermes_cli.sqlite_safe_read`` lock — held across the close, not just the open — and refuses
+    outright when a tracked connection is live.
+
     See #88052.
     """
-    byte_limit = _capped_read_limit(max_bytes)
     if _on_cloud_path(path):
         return None, True
+    from hermes_cli import sqlite_safe_read
+
+    protected = _sqlite_lock_domain(path)
+    if protected is None:
+        return None, False
+    try:
+        with sqlite_safe_read.offline_file_access(protected, what="scan a referenced script"):
+            return _read_referenced_script_unchecked(path, max_bytes=max_bytes)
+    except sqlite_safe_read.LiveConnectionError:
+        # An open SQLite database is not a shell script, so this is not "unsafe to run". Report it
+        # as "nothing read locally" (None), exactly like an unreadable path: the refusal is about
+        # THIS process's POSIX locks, so a remote-backend read — a different machine's filesystem —
+        # is still both safe and required for scan coverage. Suppressing it with "" would silently
+        # drop the remote script from the lifecycle scan.
+        return None, False
+
+
+def _read_referenced_script_unchecked(
+    path: Path, *, max_bytes: Optional[int] = None
+) -> tuple[Optional[str], bool]:
+    """The bounded, regular-file-only read itself. Callers must hold the SQLite-safe lock."""
+    byte_limit = _capped_read_limit(max_bytes)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)

@@ -66,6 +66,36 @@ class TestDoctorPlatformHints:
         assert "hermes update" not in hint
 
 
+def test_doctor_selects_bounded_state_db_probe(monkeypatch, tmp_path):
+    """Doctor must opt into the bounded FTS-only health probe.
+
+    ``PRAGMA integrity_check`` scans the whole file; on a large state.db that turns
+    `hermes doctor` into a multi-minute stall. Repair/recovery callers keep the full
+    scan — only doctor's advisory check opts out.
+    """
+    import sqlite3
+
+    import hermes_state_repair
+    from hermes_cli.doctor_report import Finding
+
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL)")
+    conn.commit()
+    conn.close()
+
+    calls = []
+
+    def recording_probe(path, **kwargs):
+        calls.append((path, kwargs))
+        return None
+
+    monkeypatch.setattr(hermes_state_repair, "_db_opens_cleanly", recording_probe)
+    doctor_state._state_db_health(Finding(), False, db_path, str(tmp_path))
+
+    assert calls == [(db_path, {"full_integrity_check": False})]
+
+
 class TestProviderEnvDetection:
     def test_detects_openai_api_key(self):
         content = "OPENAI_BASE_URL=http://localhost:1234/v1\nOPENAI_API_KEY=***"

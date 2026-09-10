@@ -36,6 +36,11 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
+    # Also truthy by default on a bare MagicMock, which would make every
+    # stored-prompt fixture here look like a tool-capable session missing the
+    # scope-owner lock and force an unwanted rebuild; default toolless like
+    # the other fixture in this test package, opt in per test.
+    agent.valid_tool_names = set()
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -445,6 +450,47 @@ class TestPerResponseSessionWritePath:
             assert second._cached_system_prompt == "GROUP_PROMPT"
             second._build_system_prompt.assert_not_called()
             assert "is null" not in caplog.text
+
+
+class TestScopeOwnerRestore:
+    """A stored prompt predating the scope-owner lock must not be reused
+    verbatim on a tool-capable session — it lacks a mandatory policy that
+    every tool-capable turn must carry."""
+
+    def test_tool_capable_legacy_prompt_without_owner_lock_rebuilds_and_persists(self):
+        from agent.scope_owner_policy import scope_ownership_guidance
+
+        stored = "Legacy prompt\nModel: test-model\nProvider: openrouter"
+        rebuilt = scope_ownership_guidance() + stored
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt=rebuilt)
+        agent.valid_tool_names = {"terminal"}
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "resume"}]
+        )
+
+        assert agent._cached_system_prompt == rebuilt
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(agent.session_id, rebuilt)
+
+    def test_tool_capable_prompt_with_owner_lock_reuses_exact_bytes(self):
+        from agent.scope_owner_policy import scope_ownership_guidance
+
+        stored = scope_ownership_guidance() + "Model: test-model\nProvider: openrouter"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+        agent.valid_tool_names = {"terminal"}
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "resume"}]
+        )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
 
 
 if __name__ == "__main__":

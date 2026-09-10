@@ -26,6 +26,7 @@ from agent.prompt_builder import (
 )
 from agent import prompt_builder as _pb
 from agent.runtime_cwd import resolve_context_cwd
+from agent.scope_owner_policy import scope_ownership_guidance
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
 
@@ -619,6 +620,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # index is built; this slot holds its position.
     _help_guidance_slot = len(stable_parts)
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    # Mandatory stable policy for every tool-capable agent, independent of skills/index
+    # availability. Living in the stable tier guarantees a restricted-tool session receives the
+    # lock before its first model/tool loop, and keeps the prefix bytes identical on later turns.
+    if getattr(agent, "valid_tool_names", None):
+        stable_parts.append(scope_ownership_guidance())
     stable_parts.extend(_guidance_parts(agent))
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill

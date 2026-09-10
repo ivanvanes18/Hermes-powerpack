@@ -194,10 +194,26 @@ class TestVideoAnalyzeTool:
             mock_response.choices[0].message.content = "OK"
             return mock_response
 
-        with patch("tools.vision_tools.async_call_llm", side_effect=capture_llm):
-            with patch("tools.vision_tools.extract_content_or_reasoning", return_value="OK"):
-                self._run(video_analyze_tool(str(video), "Describe this"))
+        with (
+            patch("tools.vision_tools.async_call_llm", side_effect=capture_llm),
+            patch("tools.vision_tools.extract_content_or_reasoning", return_value="OK"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "auxiliary": {
+                        "vision": {"timeout": 190, "temperature": 0.2},
+                        "video": {"timeout": 240, "temperature": 0.05},
+                    }
+                },
+            ),
+        ):
+            self._run(video_analyze_tool(str(video), "Describe this"))
 
+        # Video is its own auxiliary task: the router must be able to send it to a
+        # video-capable model, and auxiliary.video must win over auxiliary.vision.
+        assert captured_kwargs["task"] == "video"
+        assert captured_kwargs["timeout"] == 240
+        assert captured_kwargs["temperature"] == 0.05
         messages = captured_kwargs["messages"]
         assert len(messages) == 1
         content = messages[0]["content"]
@@ -209,6 +225,32 @@ class TestVideoAnalyzeTool:
         # No hardcoded output cap — the aux client omits max_tokens so the
         # provider uses its full output budget (max-tokens-knob policy).
         assert "max_tokens" not in captured_kwargs
+
+    def test_video_falls_back_to_vision_auxiliary_settings(self, tmp_path):
+        """Without an auxiliary.video section, the vision settings still apply (with
+        video's 180s floor), so existing configs keep working."""
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+
+        captured_kwargs = {}
+
+        async def capture_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        with (
+            patch("tools.vision_tools.async_call_llm", side_effect=capture_llm),
+            patch("tools.vision_tools.extract_content_or_reasoning", return_value="OK"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"vision": {"timeout": 300, "temperature": 0.2}}},
+            ),
+        ):
+            self._run(video_analyze_tool(str(video), "Describe this"))
+
+        assert captured_kwargs["task"] == "video"
+        assert captured_kwargs["timeout"] == 300
+        assert captured_kwargs["temperature"] == 0.2
 
     def test_non_local_backend_reads_video_from_terminal_backend(self, tmp_path, monkeypatch):
         """Non-local terminal backends must not read local host video paths.

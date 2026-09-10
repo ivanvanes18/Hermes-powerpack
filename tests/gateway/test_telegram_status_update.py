@@ -106,3 +106,79 @@ async def test_distinct_status_keys_do_not_collide(adapter):
     assert adapter._status_message_ids[("chat-1", "model-switch")] == "200"
 
 
+
+
+@pytest.mark.asyncio
+async def test_successful_delete_evicts_matching_status_cache_entries(adapter):
+    """A deleted message id must not stay cached, or the next status edit targets a
+    message Telegram no longer has and the reply silently disappears."""
+    adapter._bot.delete_message = AsyncMock(return_value=True)
+    adapter._status_message_ids = {
+        ("chat-1", "lifecycle"): "100",
+        ("chat-1", "model-switch"): "100",
+        ("chat-1", "other"): "200",
+        ("chat-2", "lifecycle"): "100",
+    }
+
+    deleted = await adapter.delete_message("chat-1", "100")
+
+    assert deleted is True
+    assert adapter._status_message_ids == {
+        ("chat-1", "other"): "200",
+        ("chat-2", "lifecycle"): "100",
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_delete_preserves_status_cache_entries(adapter):
+    """A refused deletion leaves the message in place, so the cache must survive."""
+    adapter._bot.delete_message = AsyncMock(return_value=False)
+    adapter._status_message_ids = {
+        ("chat-1", "lifecycle"): "100",
+        ("chat-1", "other"): "200",
+    }
+
+    deleted = await adapter.delete_message("chat-1", "100")
+
+    assert deleted is False
+    assert adapter._status_message_ids == {
+        ("chat-1", "lifecycle"): "100",
+        ("chat-1", "other"): "200",
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_cache_keys_are_canonical_chat_identities(adapter):
+    """The same chat arrives as int, str and '+'-prefixed str depending on the caller; all
+    three must hit one cache entry or an edit would fork into a second status bubble."""
+    adapter.send.return_value = SendResult(success=True, message_id="100")
+
+    await adapter.send_or_update_status(-100123, "lifecycle", "first")
+    assert adapter._status_message_ids == {("-100123", "lifecycle"): "100"}
+
+    adapter.edit_message.return_value = SendResult(success=True, message_id="100")
+    await adapter.send_or_update_status("-100123", "lifecycle", "second")
+
+    adapter.edit_message.assert_awaited_once()
+    assert adapter.send.await_count == 1
+    assert adapter._status_message_ids == {("-100123", "lifecycle"): "100"}
+
+
+@pytest.mark.asyncio
+async def test_delete_evicts_across_chat_id_spelling_variants(adapter):
+    """A deletion issued with a differently-spelled chat/message id must still evict: the
+    stale entry would otherwise send every later status edit at a message Telegram deleted."""
+    adapter._bot.delete_message = AsyncMock(return_value=True)
+    adapter._status_message_ids = {
+        ("123", "lifecycle"): "100",
+        ("123", "other"): "200",
+        ("456", "lifecycle"): "100",
+    }
+
+    deleted = await adapter.delete_message("+123", "+100")
+
+    assert deleted is True
+    assert adapter._status_message_ids == {
+        ("123", "other"): "200",
+        ("456", "lifecycle"): "100",
+    }

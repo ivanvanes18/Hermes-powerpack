@@ -194,8 +194,10 @@ def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: st
         # _db_opens_cleanly drives a rolled-back write to surface that.
         from hermes_state_repair import _db_opens_cleanly
         # `_db_opens_cleanly` now drives a rolled-back write so this otherwise-silent corruption class is
-        # surfaced (and repaired in place with --fix). See #50502.
-        _write_reason = _db_opens_cleanly(state_db_path)
+        # surfaced (and repaired in place with --fix). See #50502. Doctor opts into the bounded FTS
+        # probes: the whole-file `integrity_check` turns this advisory check into a multi-minute stall
+        # on a large state.db, while `hermes sessions` / repair / recovery keep the full scan.
+        _write_reason = _db_opens_cleanly(state_db_path, full_integrity_check=False)
         if _write_reason is not None:
             check_warn(f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)", f"({_write_reason})")
             _repair_state_db(f, should_fix, state_db_path, "fts")

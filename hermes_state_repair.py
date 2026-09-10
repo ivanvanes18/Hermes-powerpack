@@ -684,13 +684,18 @@ def _schema_not_built(exc: BaseException) -> bool:
     return any(m in str(exc).lower() for m in ("no such table", "no such column"))
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly(db_path: Path, *, full_integrity_check: bool = True) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the first statement that trips the malformed-schema parse (``PRAGMA journal_mode``),
     ``integrity_check``, a ``sessions`` read, FTS5 MATCH probes and a rolled-back ``messages`` write — so FTS5
     index corruption (reads and ``integrity_check`` pass, every ``INSERT INTO messages`` fails through the FTS
     triggers) is reported as unhealthy.
+
+    ``integrity_check`` scans the whole file, so on a multi-GB ``state.db`` it dominates the probe.
+    Advisory callers that only need the bounded FTS read/write health probes may pass
+    ``full_integrity_check=False``; every repair and recovery caller keeps the full scan by default,
+    because that is the only probe which sees stale B-tree indexes (#63386).
 
     See #50502.
     """
@@ -706,10 +711,11 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             # tokenizer absence must never classify as corruption.
             load_fts5_cjk_extension(conn)
             conn.execute("PRAGMA journal_mode").fetchone()
-            rows = conn.execute("PRAGMA integrity_check").fetchall()
-            problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
-            if problems:
-                return "; ".join(problems[:3])
+            if full_integrity_check:
+                rows = conn.execute("PRAGMA integrity_check").fetchall()
+                problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+                if problems:
+                    return "; ".join(problems[:3])
             conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
             # FTS5 read probe: partial shadow-table corruption makes MATCH/snippet/rank raise while integrity_check
             # reports healthy. MATCH '""' (empty phrase) parses, scans zero rows and exercises the shadow tables;

@@ -35,6 +35,30 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _inject_quick_command_context(env: dict, source: SessionSource) -> dict:
+    """Route a ``type: exec`` quick command's own out-of-band sends back to the
+    invoking chat/topic: an installed card script (e.g. gptprof) can read these
+    instead of a hardcoded target chat id."""
+    for key in ("HERMES_QUICK_CHAT_ID", "HERMES_QUICK_THREAD_ID", "HERMES_QUICK_PLATFORM"):
+        env.pop(key, None)
+
+    chat_id = getattr(source, "chat_id", None)
+    if chat_id is not None:
+        env["HERMES_QUICK_CHAT_ID"] = str(chat_id)
+
+    thread_id = getattr(source, "thread_id", None)
+    if thread_id is not None:
+        env["HERMES_QUICK_THREAD_ID"] = str(thread_id)
+
+    platform = getattr(source, "platform", None)
+    if platform is not None:
+        platform_value = getattr(platform, "value", platform)
+        if platform_value is not None:
+            env["HERMES_QUICK_PLATFORM"] = str(platform_value)
+
+    return env
+
+
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -925,25 +949,26 @@ class GatewayInboundMixin:
             return await getattr(self, f"_hm_cmd_{canonical}")(event, source, _quick_key)
         return False, None
 
-    async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str) -> str:
+    async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str, source: SessionSource) -> str:
         """Run a ``type: exec`` quick command in the gateway process (30 s cap, sanitized env — the
         gateway process has every API key in os.environ; output is redacted too)."""
         try:
             from tools.environments.local import build_subprocess_env
+            env = _inject_quick_command_context(build_subprocess_env(), source)
             proc = await asyncio.create_subprocess_shell(
                 exec_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=build_subprocess_env(),
+                env=env,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
             output = (stdout or stderr).decode().strip()
             if output:
                 from agent.redact import redact_sensitive_text
-                output = redact_sensitive_text(output)
+                output = redact_sensitive_text(output, force=True)
             return output or "Command returned no output."
         except asyncio.TimeoutError:
             return "Quick command timed out (30s)."
-        except Exception as e:
-            return f"Quick command error: {e}"
+        except Exception:
+            return "Quick command failed."
 
     async def _hm_dispatch_quick_and_plugin_commands(
         self, event: "MessageEvent", source: SessionSource, command: Optional[str]
@@ -969,7 +994,7 @@ class GatewayInboundMixin:
                 exec_cmd = qcmd.get("command", "")
                 if not exec_cmd:
                     return True, f"Quick command '/{command}' has no command defined.", command
-                return True, await self._hm_run_exec_quick_command(command, exec_cmd), command
+                return True, await self._hm_run_exec_quick_command(command, exec_cmd, source), command
             if qtype != "alias":
                 return True, f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias').", command
             new_command = self._hm_expand_alias_quick_command(event, qcmd)

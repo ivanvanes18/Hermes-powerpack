@@ -625,20 +625,28 @@ async def _vision_analyze_native(
 
 
 def _aux_call_kwargs(messages: list, model: Optional[str], default_timeout: float, *,
-                     min_timeout: Optional[float] = None) -> dict:
-    """``async_call_llm`` kwargs with ``auxiliary.vision.timeout`` / ``.temperature`` from config.
+                     min_timeout: Optional[float] = None, task: str = "vision") -> dict:
+    """``async_call_llm`` kwargs with ``auxiliary.<task>.timeout`` / ``.temperature`` from config.
     Local vision models (llama.cpp, ollama) can take well over 30s, hence generous defaults
-    (temperature 0.1); ``min_timeout`` lets video enforce a floor."""
+    (temperature 0.1); ``min_timeout`` lets video enforce a floor.
+
+    ``task`` is also the router key, so a video call reaches the video-capable auxiliary route
+    instead of the image one. Non-vision tasks read their own ``auxiliary`` section first and fall
+    back to ``auxiliary.vision`` — the same precedence ``_configured_aux_model`` uses for models,
+    so a config that only tuned ``auxiliary.vision`` keeps working."""
     timeout, temperature = default_timeout, 0.1
     try:
-        _vision_cfg = _cfg_auxiliary("vision", default={}) or {}
-        if _vision_cfg.get("timeout") is not None:
-            timeout = max(float(_vision_cfg["timeout"]), float("-inf") if min_timeout is None else min_timeout)
-        if _vision_cfg.get("temperature") is not None:
-            temperature = float(_vision_cfg["temperature"])
+        _sections = (task, "vision") if task != "vision" else ("vision",)
+        _cfgs = [_cfg_auxiliary(section, default={}) or {} for section in _sections]
+        _timeout = next((c["timeout"] for c in _cfgs if c.get("timeout") is not None), None)
+        if _timeout is not None:
+            timeout = max(float(_timeout), float("-inf") if min_timeout is None else min_timeout)
+        _temperature = next((c["temperature"] for c in _cfgs if c.get("temperature") is not None), None)
+        if _temperature is not None:
+            temperature = float(_temperature)
     except Exception:
         pass
-    return {"task": "vision", "messages": messages, "temperature": temperature, "timeout": timeout,
+    return {"task": task, "messages": messages, "temperature": temperature, "timeout": timeout,
             **({"model": model} if model else {})}
 
 
@@ -998,7 +1006,7 @@ async def video_analyze_tool(
                 f"Compress or trim the video and retry.")
         debug_call_data["video_size_bytes"] = video_size_bytes
         messages = _media_messages(prompt, "video_url", video_data_url)
-        call_kwargs = _aux_call_kwargs(messages, model, 180.0, min_timeout=180.0)
+        call_kwargs = _aux_call_kwargs(messages, model, 180.0, min_timeout=180.0, task="video")
         analysis = await _call_vision_llm(call_kwargs, "Empty video response, retrying once")
         return analysis, None
     return await _run_analysis("video", video_url, user_prompt, model, stage)

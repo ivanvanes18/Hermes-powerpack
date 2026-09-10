@@ -10,6 +10,7 @@ repo with per-project ``refs/hermes/<hash16>``, ``indexes/<hash16>``, ``projects
 with GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE so nothing leaks into the user's project.
 """
 
+import contextlib
 import hashlib
 import itertools
 import json
@@ -19,6 +20,7 @@ import re
 import shutil
 import stat as stat_mod
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +64,45 @@ _PROJECT_MARKERS = {".git", "pyproject.toml", "package.json", "Cargo.toml", "go.
 
 _SHORTSTAT_FIELDS = (("files_changed", r'(\d+) file'), ("insertions", r'(\d+) insertion'),
                      ("deletions", r'(\d+) deletion'))
+
+
+def _volatile_cache_root() -> Optional[Path]:
+    """``<active profile's HERMES_HOME>/cache``, resolved at call time.
+
+    ``CHECKPOINT_BASE`` is bound at import and therefore names the DEFAULT profile's home. Under a
+    multiplexed gateway ``get_hermes_home()`` is context-local, so reading it per call is what makes
+    the exclusion follow the profile actually running the turn.
+    """
+    try:
+        return (get_hermes_home() / "cache").resolve()
+    except Exception:
+        return None
+
+
+def _is_volatile_root(abs_path: Path) -> bool:
+    """True for directories a checkpoint must never snapshot.
+
+    Root and home are the classic "too broad" cases. The active profile's ``$HERMES_HOME/cache``
+    and the system temp root are generated, disposable and can grow large enough that ``git add``
+    exceeds ``_GIT_TIMEOUT`` and leaves the shadow store's ``index.lock`` stranded — which then
+    blocks checkpoints for every real project. Each discovery failure degrades to "not volatile"
+    independently, so an unresolvable temp dir or home can never disable checkpoints for real work.
+    """
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve()
+    except Exception:
+        temp_root = None
+    cache_root = _volatile_cache_root()
+    broad = {Path("/")}
+    with contextlib.suppress(Exception):
+        broad.add(Path.home())
+    if temp_root is not None:
+        broad.add(temp_root)
+    if cache_root is not None:
+        broad.add(cache_root)
+    if abs_path in broad:
+        return True
+    return cache_root is not None and cache_root in abs_path.parents
 
 
 def _no_store_result() -> Dict:
@@ -631,7 +672,7 @@ class CheckpointManager:
         if not self._git_available:
             return False
         abs_dir = str(_normalize_path(working_dir))
-        if abs_dir in {"/", str(Path.home())}:  # never snapshot root/home
+        if _is_volatile_root(Path(abs_dir)):
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
         if abs_dir in self._checkpointed_dirs:

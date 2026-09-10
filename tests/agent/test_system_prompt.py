@@ -394,9 +394,12 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
         "this one. Do not modify another profile's skills/plugins/cron/memories "
         "unless the user explicitly directs you to."
     )
+    from agent.scope_owner_policy import scope_ownership_guidance
+
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
+        scope_ownership_guidance().strip(),
         "STEER",
         "CODING_STABLE",
         "SYSTEM_MESSAGE",
@@ -425,7 +428,7 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
 
 
 class TestTelegramRichMessagesHint:
@@ -581,6 +584,24 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+class TestScopeOwnerPolicy:
+    """Mandatory stable-tier lock for every tool-capable agent (independent of
+    skills/index availability), keeping a toolless agent's bytes unchanged."""
+
+    def test_restricted_tool_agent_gets_exactly_one_stable_lock(self):
+        from agent.scope_owner_policy import scope_ownership_guidance
+
+        parts = _prompt_parts(_make_agent(valid_tool_names=["terminal"]))
+        assert parts["stable"].count("### Scope-owner lock") == 1
+        assert scope_ownership_guidance() in parts["stable"]
+        assert "### Scope-owner lock" not in parts["volatile"]
+
+    def test_toolless_agent_is_unchanged(self):
+        parts = _prompt_parts(_make_agent(valid_tool_names=[]))
+        assert "### Scope-owner lock" not in parts["stable"]
+        assert "### Scope-owner lock" not in parts["volatile"]
 
 
 class TestMemoryProviderSystemPromptGating:

@@ -3203,6 +3203,20 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
 # compression case.
 _TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision"})
 
+# Auxiliary tasks whose payload carries media the model must actually see. They share one
+# capability requirement — a multimodal backend — so they share one route: the vision provider
+# chain, vision-aware async client shaping and the vision lane of the Portal recommendation.
+# Routing any of them through the plain text client can silently select a text-only model that
+# answers about a video it never received. Per-task identity is preserved elsewhere: the resolved
+# ``auxiliary.<task>.provider/model`` are passed into the chain as EXPLICIT arguments, which
+# outrank ``auxiliary.vision.*`` in ``_resolve_task_provider_model``.
+_VISION_CAPABLE_TASKS = frozenset({"vision", "video"})
+
+
+def _is_vision_capable_task(task: Optional[str]) -> bool:
+    """True when *task* needs a multimodal-capable backend rather than a text one."""
+    return task in _VISION_CAPABLE_TASKS
+
 
 def _should_skip_same_provider_retry(task: Optional[str], exc: Exception) -> bool:
     """True when a transient error on a critical-path task should go straight to fallback.
@@ -3355,7 +3369,7 @@ def _prepare_same_provider_retry(
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Rebuild (client, request kwargs) for a same-provider retry after credential recovery."""
-    if task == "vision":
+    if _is_vision_capable_task(task):
         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
             provider=resolved_provider, model=final_model, base_url=resolved_base_url,
             api_key=resolved_api_key, async_mode=async_mode,
@@ -6509,7 +6523,7 @@ def _resolve_call_client(
     """Resolve the client for one aux call: vision chain, or cached text client with the
     explicit-provider fallback_chain / auto-chain rescue; RuntimeError when nothing is configured."""
     effective_provider = resolved_provider
-    if task == "vision":
+    if _is_vision_capable_task(task):
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model, base_url=resolved_base_url or base_url,
@@ -6544,7 +6558,7 @@ def _resolve_call_client(
                 client, final_model = fb_client, fb_model
                 if async_mode:
                     client, final_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision"))
+                        fb_client, fb_model or "", is_vision=_is_vision_capable_task(task))
                 resolved_provider = fb_label or resolved_provider
                 effective_provider = resolved_provider
             # Auto/custom with no credentials: walk the full auto chain (not just OpenRouter).
@@ -6733,7 +6747,7 @@ def _refreshed_nous_step(route: _LadderRoute, kwargs: Dict[str, Any], message: s
         lookup_model=route.resolved_model, lookup_task=route.task, async_mode=route.async_mode,
         base_url=route.resolved_base_url, api_key=route.resolved_api_key,
         api_mode=route.resolved_api_mode, main_runtime=route.main_runtime,
-        is_vision=(route.task == "vision"),
+        is_vision=_is_vision_capable_task(route.task),
     )
     if refreshed_client is None:
         return None
@@ -6753,7 +6767,7 @@ def _ladder_nous_rungs(
     # 404s); force a fresh Portal fetch and retry once.
     if _is_model_not_found_error(first_err) and client_is_nous:
         healed_model = _refresh_nous_recommended_model(
-            vision=(task == "vision"), stale_model=kwargs.get("model"))
+            vision=_is_vision_capable_task(task), stale_model=kwargs.get("model"))
         if healed_model and healed_model != kwargs.get("model"):
             logger.warning("Auxiliary %s%s: model %r no longer in Nous catalog; "
                            "retrying with refreshed recommendation %r",
@@ -7370,7 +7384,7 @@ async def _async_call_llm_impl(
             if kind == "retry":
                 return await _retry_same_provider_async(**kw)
             fb_client, fb_model, fb_label = args
-            fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
+            fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=_is_vision_capable_task(task))
             return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
         result = await _drive_ladder_async(
             _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=True, route_info=route_info),
