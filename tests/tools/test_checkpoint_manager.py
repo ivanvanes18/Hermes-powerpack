@@ -337,6 +337,51 @@ class TestRealPruning:
         assert "small.py" in names
         assert "weights.bin" not in names  # filtered by size cap
 
+    def test_oversize_file_is_excluded_before_git_add(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """Git must never hash a multi-GB file merely to discard it afterwards."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        monkeypatch.setattr("tools.checkpoint_manager._GIT_TIMEOUT", 1.0)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "small.py").write_text("tiny\n")
+        huge = wd / "state.db"
+        with huge.open("wb") as fh:
+            fh.truncate(4 * 1024**3)
+
+        m = CheckpointManager(enabled=True, max_snapshots=5, max_file_size_mb=1)
+        assert m.ensure_checkpoint(str(wd), "skip huge input") is True
+
+        store = _store_path(checkpoint_base)
+        ok, files, _ = _run_git(
+            ["ls-tree", "-r", "--name-only", _ref_name(_project_hash(str(wd)))],
+            store, str(wd),
+        )
+        assert ok
+        assert "small.py" in files.splitlines()
+        assert "state.db" not in files.splitlines()
+        assert not Path(f"{store / 'indexes' / _project_hash(str(wd))}.lock").exists()
+
+    @pytest.mark.parametrize("operation", ["diff", "safe_restore_plan"])
+    def test_current_tree_comparisons_exclude_oversize_before_git_add(
+        self, work_dir, checkpoint_base, monkeypatch, operation,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        m = CheckpointManager(enabled=True, max_snapshots=5, max_file_size_mb=1)
+        assert m.ensure_checkpoint(str(work_dir), "baseline") is True
+        checkpoint = m.list_checkpoints(str(work_dir))[0]["hash"]
+        huge = work_dir / "state.db"
+        with huge.open("wb") as fh:
+            fh.truncate(4 * 1024**3)
+        monkeypatch.setattr("tools.checkpoint_manager._GIT_TIMEOUT", 1.0)
+
+        result = getattr(m, operation)(str(work_dir), checkpoint)
+
+        assert result["success"] is True
+        store = _store_path(checkpoint_base)
+        assert not Path(f"{store / 'indexes' / _project_hash(str(work_dir))}.lock").exists()
+
 
 # =========================================================================
 # CheckpointManager — restoring

@@ -571,20 +571,6 @@ def _locate(working_dir: str, commit_hash: str,
     return p, None if _store_has_head(p.store) else _no_store_result()
 
 
-def _stage_all(p: _ProjectRefs) -> Tuple[bool, str, str]:
-    """``git add -A`` into the per-project index."""
-    return _run_git(["add", "-A"], p.store, p.abs_dir, timeout=_GIT_TIMEOUT * 2, index_file=p.index_file)
-
-
-def _diff_staged_tree(p: _ProjectRefs, *diff_args: List[str]) -> List[Tuple[bool, str, str]]:
-    """Stage the working tree (so new files show), run each ``git diff`` variant,
-    then point the index back at the ref so it doesn't drift."""
-    _stage_all(p)
-    results = [_run_git(args, p.store, p.abs_dir, index_file=p.index_file) for args in diff_args]
-    _run_git(["read-tree", p.ref], p.store, p.abs_dir, index_file=p.index_file, allowed_returncodes={128})
-    return results
-
-
 def _commit_exists(p: _ProjectRefs, commit_hash: str) -> Tuple[bool, str]:
     ok, _, err = _run_git(["cat-file", "-t", commit_hash], p.store, p.abs_dir)
     return ok, err
@@ -644,16 +630,27 @@ class CheckpointManager:
         p, err = _locate(working_dir, commit_hash)
         if err:
             return err
+        assert p is not None
 
-        (ok, names_out, err), = _diff_staged_tree(p, ["diff", "--name-only", "-z", commit_hash, "--cached"])
+        (ok, names_out, err), = self._diff_staged_tree(
+            p, ["diff", "--name-only", "-z", commit_hash, "--cached"])
         if not ok:
             return {"success": False, "error": f"Could not compute changed files: {err}"}
+
+        # Oversize files absent from the checkpoint are intentionally not staged,
+        # but safe restore must still classify and report them as unrecoverable.
+        listed_ok, oversize, listed_err = self._oversize_worktree_paths(p)
+        if not listed_ok:
+            return {"success": False, "error": f"Could not inspect current files: {listed_err}"}
+        changed = list(filter(None, names_out.split("\x00")))
+        seen = set(changed)
+        changed.extend(rel for rel in oversize if rel not in seen)
 
         ledger = _load_ledger(p.store, p.dir_hash)
         if not ledger:
             return {"success": True, "restore": [], "skipped": [], "ledger_empty": True}
         out: Dict[str, List[str]] = {"restore": [], "skipped": []}
-        for rel in filter(None, names_out.split("\x00")):
+        for rel in changed:
             abs_path = Path(p.abs_dir) / rel
             entry = ledger.get(str(abs_path))
             recorded = entry.get("sha256") if isinstance(entry, dict) else None
@@ -728,11 +725,12 @@ class CheckpointManager:
         p, err = _locate(working_dir, commit_hash)
         if err:
             return err
+        assert p is not None
         ok, _ = _commit_exists(p, commit_hash)
         if not ok:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' not found"}
 
-        (ok_stat, stat_out, _), (ok_diff, diff_out, _) = _diff_staged_tree(
+        (ok_stat, stat_out, _), (ok_diff, diff_out, _) = self._diff_staged_tree(
             p, ["diff", "--stat", commit_hash, "--cached"], ["diff", commit_hash, "--cached", "--no-color"])
         if not ok_stat and not ok_diff:
             return {"success": False, "error": "Could not generate diff"}
@@ -857,12 +855,9 @@ class CheckpointManager:
         ref_commit = _ref_tip(p.store, working_dir, p.ref)
         _seed_project_index(p, ref_commit)
 
-        # Broad patterns come from the exclude file; oversize paths are dropped post-stage.
-        ok, _, err = _stage_all(p)
+        ok, _, err = self._stage_worktree(p)
         if not ok:
             return _step_failed("git-add", err)
-        if self.max_file_size_mb > 0:
-            self._drop_oversize_from_index(p.store, working_dir, p.index_file)
 
         skip = _index_unchanged_reason(p, ref_commit)
         if skip:
@@ -885,6 +880,72 @@ class CheckpointManager:
         self._prune(p.store, working_dir, p.ref)
         self._enforce_size_cap(p.store)
         return True
+
+    def _diff_staged_tree(
+        self, p: _ProjectRefs, *diff_args: List[str],
+    ) -> List[Tuple[bool, str, str]]:
+        """Stage safely, run each diff, then reset the shared index to its ref."""
+        ok, _, err = self._stage_worktree(p)
+        if not ok:
+            return [(False, "", err) for _ in diff_args]
+        try:
+            return [_run_git(args, p.store, p.abs_dir, index_file=p.index_file) for args in diff_args]
+        finally:
+            _run_git(["read-tree", p.ref], p.store, p.abs_dir,
+                     index_file=p.index_file, allowed_returncodes={128})
+
+    def _stage_worktree(self, p: _ProjectRefs) -> Tuple[bool, str, str]:
+        """Stage without asking Git to hash files above the checkpoint cap."""
+        ok, oversize, err = self._oversize_worktree_paths(p)
+        if not ok:
+            return False, "", err
+        if not oversize:
+            result = _run_git(["add", "-A"], p.store, p.abs_dir,
+                              timeout=_GIT_TIMEOUT * 2, index_file=p.index_file)
+        else:
+            p.index_file.parent.mkdir(parents=True, exist_ok=True)
+            pathspec_file: Optional[Path] = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", prefix=".pathspec-", dir=p.index_file.parent, delete=False,
+                ) as fh:
+                    pathspec_file = Path(fh.name)
+                    fh.write(b".\x00")
+                    for rel in oversize:
+                        encoded = f":(exclude,literal){rel}".encode(
+                            "utf-8", errors="surrogateescape")
+                        fh.write(encoded + b"\x00")
+                result = _run_git(
+                    ["add", "-A", f"--pathspec-from-file={pathspec_file}", "--pathspec-file-nul"],
+                    p.store, p.abs_dir, timeout=_GIT_TIMEOUT * 2, index_file=p.index_file)
+            finally:
+                if pathspec_file is not None:
+                    _unlink_quiet(pathspec_file)
+        if result[0] and self.max_file_size_mb > 0:
+            # A file can cross the cap after the scan and before Git stages it.
+            self._drop_oversize_from_index(p.store, p.abs_dir, p.index_file)
+        return result
+
+    def _oversize_worktree_paths(self, p: _ProjectRefs) -> Tuple[bool, List[str], str]:
+        """Return stageable regular files too large for a checkpoint."""
+        cap = self.max_file_size_mb * _MB
+        if cap <= 0:
+            return True, [], ""
+        root = Path(p.abs_dir)
+        ok, names, err = _run_git(
+            ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            p.store, p.abs_dir, index_file=p.index_file)
+        if not ok:
+            return False, [], err
+        result: List[str] = []
+        for rel in filter(None, names.split("\x00")):
+            path = root / rel
+            try:
+                if not path.is_symlink() and path.stat().st_size > cap:
+                    result.append(rel)
+            except OSError:
+                continue
+        return True, result, ""
 
     def _exceeds_size_cap(self, path: Path) -> bool:
         """Whether *path* is larger than ``max_file_size_mb`` (0 disables; unstattable => False).
@@ -911,7 +972,8 @@ class CheckpointManager:
         logger.debug("Checkpoint: dropping %d oversize file(s) (>%d MB) from index",
                      len(oversize), self.max_file_size_mb)
         for i in range(0, len(oversize), 200):  # chunk: never overflow argv
-            _run_git(["rm", "--cached", "--quiet", "--"] + oversize[i:i + 200],
+            _run_git(["--literal-pathspecs", "rm", "--cached", "--force", "--quiet",
+                      "--ignore-unmatch", "--"] + oversize[i:i + 200],
                      store, working_dir, index_file=index_file, allowed_returncodes={128})
 
     def _prune(self, store: Path, working_dir: str, ref: str) -> None:
