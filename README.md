@@ -1,3 +1,9 @@
+# Hermes Powerpack
+
+This public distribution includes upstream Hermes Agent plus a small public-safe Powerpack skill layer. See [README-POWERPACK.md](README-POWERPACK.md) for workshop install instructions.
+
+---
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
