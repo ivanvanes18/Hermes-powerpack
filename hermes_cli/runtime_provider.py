@@ -498,8 +498,11 @@ def _refresh_nous_pool_entry(pool: CredentialPool, entry: Any, pool_api_key: str
 
 
 def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[str, Any], explicit_api_key, explicit_base_url,
-                       target_model) -> Optional[Dict[str, Any]]:
-    """Runtime from the provider's credential pool, or None to continue down the ladder."""
+                       target_model, preferred_credential_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Runtime from the provider's credential pool, or None to continue down the ladder.
+    ``preferred_credential_id`` pins one row of THIS provider's pool (an affinity, honoured only while
+    that row is available — see ``CredentialPool.select``); an id belonging to another provider's pool
+    simply misses here and the pool's normal strategy serves the turn."""
     should_use_pool = provider != "openrouter" or _openrouter_should_use_pool(requested_provider, model_cfg, explicit_api_key,
                                                                              explicit_base_url)
     try:
@@ -508,7 +511,9 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[s
         pool = None
     if not (pool and pool.has_credentials()):
         return None
-    entry = pool.select()
+    # Keep the historical zero-arg call when nothing is pinned: duck-typed pool stand-ins
+    # implement ``select()`` without the parameter.
+    entry = pool.select(preferred_credential_id) if preferred_credential_id else pool.select()
     if entry is None:
         return None
     pool_api_key = _pool_entry_api_key(entry)
@@ -811,7 +816,8 @@ def _opencode_free_runtime(provider, requested_provider, model_cfg, target_model
 
 
 def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
-                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> Dict[str, Any]:
+                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None,
+                             preferred_credential_id: Optional[str] = None) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
     rung returns or raises, else falls to the next):
       1. disabled-provider guard (``providers.<name>.enabled: false``)
@@ -824,13 +830,19 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
          → external-process → anthropic env → bedrock → registry api_key providers
       8. OpenRouter / bare-custom fallback
     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
-    OpenCode Zen/Go where different models route through different API surfaces)."""
+    OpenCode Zen/Go where different models route through different API surfaces).
+    preferred_credential_id is an INTERNAL affinity hint (the gateway's per-topic credential
+    preference): a non-secret credential-pool row id applied at rung 6 to the resolved provider's own
+    pool only. It never selects a provider, and an unknown/benched row falls back to that pool's
+    normal strategy."""
     requested_provider = resolve_requested_provider(requested)
     _raise_if_provider_disabled(requested_provider)
-    return next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
+    return next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model,
+                                         preferred_credential_id) if r)
 
 
-def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model):
+def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model,
+                  preferred_credential_id=None):
     """Ladder rungs 2-8, yielded lazily so each is evaluated only when the previous one returned
     nothing; the last rung (OpenRouter / bare-custom fallback) always yields a runtime."""
     yield _resolve_requested_shortcuts(requested_provider, explicit_api_key, explicit_base_url, target_model)
@@ -848,7 +860,8 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
                                     explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
                                     target_model=target_model)
-    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
+    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model,
+                             preferred_credential_id)
     if provider in _OAUTH_RUNTIME_PROVIDERS:
         yield _resolve_oauth_runtime(provider, requested_provider, model_cfg, target_model)
     if provider == "minimax-oauth":

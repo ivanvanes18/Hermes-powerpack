@@ -2156,15 +2156,21 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_pending_turn_sidecar_notes")
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(preferred_credential_id: Optional[str] = None) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
-    ``resolve_runtime_provider()`` may fall back to env vars; behavioral config is config.yaml only."""
+    ``resolve_runtime_provider()`` may fall back to env vars; behavioral config is config.yaml only.
+    ``preferred_credential_id`` pins a channel's preferred credential-pool row on the provider this
+    resolves to anyway (see ``ChannelOverride.credential_id``); the fallback chain below resolves its
+    own providers and never inherits the pin."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider, format_runtime_provider_error, _get_model_config)
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     try:
-        runtime = resolve_runtime_provider()
+        # Keep the historical zero-arg call when nothing is pinned, so resolution stays
+        # byte-for-byte the same for every caller that declares no channel preference.
+        runtime = (resolve_runtime_provider(preferred_credential_id=preferred_credential_id)
+                   if preferred_credential_id else resolve_runtime_provider())
     except AuthError as auth_exc:
         # Rate-limit cap vs real auth failure: both use the fallback chain; the log must not mislabel.
         # Distinguish a transient rate-limit/quota cap (credentials are fine, re-auth cannot help) from a
@@ -2279,11 +2285,14 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         context_length=context_length, context_source=context_source)
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
-    """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
+def _resolve_runtime_agent_kwargs_for_provider(
+        provider: str, *, preferred_credential_id: Optional[str] = None) -> dict:
+    """Resolve runtime credentials for a specific provider (e.g. from channel override).
+    ``preferred_credential_id`` pins a row of THAT provider's own credential pool."""
     from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        runtime = (resolve_runtime_provider(requested=provider, preferred_credential_id=preferred_credential_id)
+                   if preferred_credential_id else resolve_runtime_provider(requested=provider))
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -2815,13 +2824,13 @@ def _channel_override_lookup_keys(
     chat_id: str, *, thread_id: Optional[str] = None, parent_id: Optional[str] = None) -> list[str]:
     """Ordered, de-duplicated ``channel_overrides`` lookup keys (matches ``resolve_channel_prompt``:
     exact id first, then parent — Discord threads inherit parent overrides)."""
-    return list(dict.fromkeys(str(key) for key in (chat_id, thread_id, parent_id) if key))
+    return list(dict.fromkeys(str(key) for key in (thread_id, chat_id, parent_id) if key))
 
 
 def _get_channel_override(
     config: GatewayConfig, platform: Platform, chat_id: str, *, thread_id: Optional[str] = None,
     parent_id: Optional[str] = None) -> Optional[ChannelOverride]:
-    """Per-channel override via chat_id, then thread_id, then parent_id; None if absent."""
+    """Per-channel override via thread_id, then chat_id, then parent_id; None if absent."""
     platforms = getattr(config, "platforms", None)
     if not platforms:
         return None

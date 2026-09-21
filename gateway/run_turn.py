@@ -97,28 +97,38 @@ class GatewayTurnMixin:
                 ][:5] or "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        runtime_model = runtime_kwargs.pop("model", None)
-        if runtime_model:
-            logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
-            model = runtime_model
-
         cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
+        ch = None
         if cfg and source is not None:
             ch = _get_channel_override(
                 cfg, source.platform, str(source.chat_id) if source.chat_id else "",
                 thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
                 parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
             )
-            if ch:
-                if ch.model:
-                    model = ch.model
-                if ch.provider:
-                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(ch.provider)
-                    ch_runtime_model = runtime_kwargs.pop("model", None)
-                    # Adopt the provider's bundled model only when the override named none.
-                    if ch_runtime_model and not ch.model:
-                        model = ch_runtime_model
+        # A channel/topic may prefer one credential-pool row by non-secret id. It is resolved
+        # BEFORE the runtime call so a pin without a ``provider:`` lands on the provider this
+        # channel resolves to anyway, rather than inventing one.
+        preferred_credential_id = (ch.credential_id or None) if ch else None
+
+        runtime_kwargs = (
+            _resolve_runtime_agent_kwargs(preferred_credential_id=preferred_credential_id)
+            if preferred_credential_id else _resolve_runtime_agent_kwargs()
+        )
+        runtime_model = runtime_kwargs.pop("model", None)
+        if runtime_model:
+            logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
+            model = runtime_model
+
+        if ch:
+            if ch.model:
+                model = ch.model
+            if ch.provider:
+                runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                    ch.provider, preferred_credential_id=preferred_credential_id)
+                ch_runtime_model = runtime_kwargs.pop("model", None)
+                # Adopt the provider's bundled model only when the override named none.
+                if ch_runtime_model and not ch.model:
+                    model = ch_runtime_model
 
         if override and skey:
             model, runtime_kwargs = self._apply_session_model_override(skey, model, runtime_kwargs)

@@ -68,6 +68,81 @@ class TestGetChannelOverride:
         assert result is not None
         assert result.model == "topic-model"
 
+    def test_telegram_topic_override_beats_the_containing_chat(self):
+        """A Telegram forum topic id is NARROWER than the supergroup chat_id it
+        arrives with, so the topic's own override must win. Matching
+        ``resolve_channel_prompt``, which the Telegram adapter already calls
+        with ``thread_id or chat_id`` first."""
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "-1001234567890": ChannelOverride(model="forum-wide-model"),
+                        "42": ChannelOverride(model="topic-model", credential_id="cred-topic"),
+                    },
+                ),
+            },
+        )
+        result = _get_channel_override(
+            config, Platform.TELEGRAM, "-1001234567890", thread_id="42"
+        )
+        assert result is not None
+        assert result.model == "topic-model"
+        assert result.credential_id == "cred-topic"
+
+    def test_telegram_chat_override_still_applies_to_topics_without_one(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "-1001234567890": ChannelOverride(model="forum-wide-model"),
+                    },
+                ),
+            },
+        )
+        result = _get_channel_override(
+            config, Platform.TELEGRAM, "-1001234567890", thread_id="99"
+        )
+        assert result is not None
+        assert result.model == "forum-wide-model"
+
+    def test_discord_thread_keeps_exact_then_parent_inheritance(self):
+        """Discord sets ``thread_id == chat_id`` for a thread channel, so the
+        exact thread override must still win and a thread with none must still
+        inherit its parent's."""
+        exact_and_parent = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "thread_1": ChannelOverride(model="thread-model"),
+                        "parent_1": ChannelOverride(model="parent-model"),
+                    },
+                ),
+            },
+        )
+        exact = _get_channel_override(
+            exact_and_parent, Platform.DISCORD, "thread_1",
+            thread_id="thread_1", parent_id="parent_1",
+        )
+        assert exact is not None and exact.model == "thread-model"
+
+        parent_only = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={"parent_1": ChannelOverride(model="parent-model")},
+                ),
+            },
+        )
+        inherited = _get_channel_override(
+            parent_only, Platform.DISCORD, "thread_2",
+            thread_id="thread_2", parent_id="parent_1",
+        )
+        assert inherited is not None and inherited.model == "parent-model"
+
 
 class TestResolveModelForChannel:
     def test_uses_channel_override_when_present(self):

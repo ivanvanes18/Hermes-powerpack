@@ -358,13 +358,25 @@ class ChannelOverride:
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
+    # Preferred credential-pool row for this channel/topic, by the stable
+    # non-secret id shown in ``hermes auth list``. It is a POINTER, never token
+    # material: runtime resolution treats it as an affinity and falls back to
+    # the pool's normal strategy when the row is unknown or benched.
+    credential_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        raw = self.credential_id
+        self.credential_id = stripped if isinstance(raw, str) and (stripped := raw.strip()) else None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ChannelOverride":
-        return cls(**{f.name: data.get(f.name) for f in fields(cls)}) if data else cls()
+        if not data:
+            return cls()
+        values = {f.name: data.get(f.name) for f in fields(cls)}
+        return cls(**values)
 
 
 # Platforms whose primary credential is ``PlatformConfig.token`` → its env var (empty-token

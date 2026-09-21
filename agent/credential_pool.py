@@ -5,6 +5,7 @@ from __future__ import annotations
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 
 import logging
+import hashlib
 import os
 import random
 import threading
@@ -908,6 +909,36 @@ _RESYNC_SOURCE = {
 }
 
 
+# (provider, credential_id) pairs already warned about an unusable selection
+# preference. Selection runs on every model call, so an unknown/benched
+# preference would otherwise re-log per turn for the lifetime of the
+# misconfiguration (same log-storm class as NO_AVAILABLE_ENTRIES_LOG_THROTTLE).
+_PREFERENCE_WARNED: Set[Tuple[str, str]] = set()
+
+
+def credential_id_fingerprint(credential_id: str) -> str:
+    """Return a bounded one-way identifier for affinity diagnostics."""
+    return hashlib.sha256(credential_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _warn_preference_unusable_once(provider: str, credential_id: str, reason: str) -> None:
+    """WARN once per process that a pinned credential could not be honoured.
+
+    The configured value is fingerprinted because a mistyped credential id
+    may actually be pasted token material.
+    """
+    key = (provider, credential_id)
+    if key in _PREFERENCE_WARNED:
+        return
+    _PREFERENCE_WARNED.add(key)
+    logger.warning(
+        "credential pool: preferred %s credential %s is %s — falling back to "
+        "the pool's normal selection strategy. Run `hermes auth list %s` to "
+        "check the id.",
+        provider, credential_id_fingerprint(credential_id), reason, provider,
+    )
+
+
 class _RefreshDone(Exception):
     """Raised inside a provider refresher to short-circuit ``_refresh_entry_impl`` with ``result``."""
 
@@ -1780,20 +1811,40 @@ class CredentialPool(CredentialPoolAdminMixin):
 
     # ---- selection ---------------------------------------------------------
 
-    def select(self) -> Optional[PooledCredential]:
-        entry, pending_refresh = self._select_under_lock()
+    def select(self, preferred_credential_id: Optional[str] = None) -> Optional[PooledCredential]:
+        """Select a credential, optionally pinning one exact row.
+
+        *preferred_credential_id* is an affinity, not a guarantee: the pinned
+        row is returned only when it is available under the very same
+        cooldown-clear / resync / proactive-refresh rules an unpinned select
+        applies. An unknown, exhausted or DEAD pin falls back to the pool's
+        configured strategy so the caller keeps serving traffic. The pin is
+        caller-local — it never reorders the pool for anyone else.
+        """
+        entry, pending_refresh = self._select_under_lock(preferred_credential_id)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
             # Re-select now that the refreshed entries are back in the pool.
-            if entry is None:
-                entry, _ = self._select_under_lock()
+            if entry is None or (
+                preferred_credential_id
+                and any(candidate.id == preferred_credential_id for candidate in pending_refresh)
+            ):
+                entry, _ = self._select_under_lock(
+                    preferred_credential_id, count_pending_fallback=True,
+                )
         if entry is not None:
             self._unmatched_rotation_streak = 0
         return entry
 
-    def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+    def _select_under_lock(
+        self, preferred_credential_id: Optional[str] = None,
+        *, count_pending_fallback: bool = False,
+    ) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         with self._lock:
-            return self._select_unlocked()
+            return self._select_unlocked(
+                preferred_credential_id=preferred_credential_id,
+                count_pending_fallback=count_pending_fallback,
+            )
 
     def _refresh_pending_entries(self, pending: List[PooledCredential]) -> None:
         """Refresh deferred single-use-token entries OUTSIDE the pool lock.
@@ -1912,11 +1963,15 @@ class CredentialPool(CredentialPoolAdminMixin):
 
     def _select_unlocked(
         self, *, refresh: bool = True, count: bool = True,
+        preferred_credential_id: Optional[str] = None,
+        count_pending_fallback: bool = False,
     ) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         """Select the best available entry; returns ``(entry, pending_refresh)``.
 
         ``count=False`` skips the ``request_count`` bump for selections that are
         not going to serve a request (a forced-refresh target lookup).
+        ``preferred_credential_id`` pins one row when it survived the
+        availability pass above (see ``select``).
         """
         available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
         if not available:
@@ -1928,7 +1983,25 @@ class CredentialPool(CredentialPoolAdminMixin):
         # logs immediately.
         self._last_no_entries_log_at = None
 
-        if self._strategy == STRATEGY_RANDOM:
+        # An affinity pin is resolved against ``available`` — the post-clear,
+        # post-resync, post-refresh view — so it can never revive a benched or
+        # unhydrated row that an unpinned select would have skipped.
+        preferred = None
+        preferred_pending = bool(
+            preferred_credential_id
+            and any(e.id == preferred_credential_id for e in pending_refresh)
+        )
+        if preferred_credential_id:
+            preferred = next((e for e in available if e.id == preferred_credential_id), None)
+            if preferred is None and not preferred_pending:
+                _warn_preference_unusable_once(
+                    self.provider, preferred_credential_id,
+                    "unavailable" if self._find(lambda e: e.id == preferred_credential_id) else "not in the pool",
+                )
+
+        if preferred is not None:
+            entry = preferred
+        elif self._strategy == STRATEGY_RANDOM:
             entry = random.choice(available)
         elif self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
             entry = min(available, key=lambda e: e.request_count)
@@ -1937,9 +2010,12 @@ class CredentialPool(CredentialPoolAdminMixin):
         # Count the selection under every strategy. The counter is ``least_used``'s
         # baseline and reaches auth.json on the next persist (exhaustion, rotation,
         # refresh); it used to move only while ``least_used`` was active.
-        if count:
+        if count and (not preferred_pending or count_pending_fallback):
             entry = self._adopt(entry, persist=False, request_count=entry.request_count + 1)
-        if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
+        # A pinned selection is local to its caller: rotating round_robin's
+        # global priorities here would let one pinned topic reshuffle the order
+        # every other caller reads.
+        if preferred is None and self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]

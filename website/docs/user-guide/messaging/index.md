@@ -297,14 +297,24 @@ platforms:
         system_prompt: "You are the #dev channel code-review specialist."
       "987654321098765432":
         model: openai/gpt-5-mini
+      "3391":                      # a Telegram forum topic id
+        credential_id: 6f1c0a2e-...   # from `hermes auth list <provider>`
 ```
 
 Details:
 
-- All three keys are optional — set only `model`, only `system_prompt`, or any combination. Unset fields fall back to the global defaults.
+- All four keys are optional — set only `model`, only `system_prompt`, or any combination. Unset fields fall back to the global defaults.
 - Lookup order is exact channel/thread id first, then the **parent** channel/forum id — so Discord threads inherit their parent channel's override automatically.
 - Resolution priority for the model is: session `/model` override → `channel_overrides` → global config. A user running `/model` in a chat still wins over the channel default.
 - The `system_prompt` override replaces the global gateway prompt for that channel (it is ephemeral — injected per turn, not stored in history).
+
+### Pinning a credential per channel
+
+`credential_id` gives a channel (or a Telegram forum topic) an **affinity** for one row of the provider's credential pool — useful when each topic should bill a different account. Use the stable id printed as `[id:…]` by `hermes auth list <provider>`; it is a pointer, never a token, so it is safe to keep in config.
+
+- Set it alone to pin a row of the provider the channel already resolves to, or alongside `provider:` to pin a row of that provider's pool.
+- It is an affinity, not a lock: if the row is rate-limited, dead or unknown, that channel falls back to the pool's normal selection strategy and keeps working (a warning naming the provider and id is logged once).
+- A rate-limit rotation in one channel stays in that channel — it neither moves another channel's pinned credential nor reorders the pool for everyone else.
 
 ## Security
 
