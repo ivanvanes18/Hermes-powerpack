@@ -33,6 +33,9 @@ _BLOCK_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"(?i)\b(?:sk|jv_live)_[a-z0-9_-]{6,}\b"),
     re.compile(r"(?i)\b(?:contract|договор|act|акт)\b"),
+    re.compile(r"(?i)<\s*memory-context\b|\b(?:tool\s+output|recalled\s+memory)\b"),
+    re.compile(r"(?i)\b(?:telegram|session)\s+(?:chat\s+)?(?:id|identifier)\b"),
+    re.compile(r"(?i)\bapi\s*key\s*[:=]\s*(?![«\[]?redacted)|https?://[^\s/@]+:[^\s/@]+@"),
 )
 
 class ShadowContractError(ValueError):

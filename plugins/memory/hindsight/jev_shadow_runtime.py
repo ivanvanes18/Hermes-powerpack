@@ -24,6 +24,15 @@ _PROCESS_LOCKS: dict[str, threading.Lock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
 
 
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ShadowTransportError("duplicate_key")
+        result[key] = value
+    return result
+
+
 @dataclass(frozen=True)
 class PilotSnapshot:
     pilot_id: str
@@ -326,7 +335,7 @@ class TypeSafeTransport:
             req = urllib.request.Request(self.url, data=body, method="POST", headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
             try:
                 with urllib.request.urlopen(req, timeout=remaining) as response: raw = response.read()
-                try: value = json.loads(raw.decode())
+                try: value = json.loads(raw.decode(), object_pairs_hook=_reject_duplicate_json_keys)
                 except (ValueError, UnicodeDecodeError) as exc: raise ShadowTransportError("invalid_json") from exc
                 if not isinstance(value, dict): raise ShadowTransportError("response_invalid")
                 return value
@@ -346,6 +355,7 @@ class JevShadowRuntime:
         self.config = config; self.store = store; self.transport = transport; self.policy = config.policy or ShadowPolicy()
         self._queue = queue.Queue(maxsize=config.max_queue); self._stop = threading.Event(); self._thread = None
         self._disabled = False; self._persistence_error: str | None = None
+        self._admission_lock = threading.Lock(); self._admitted: set[str] = set()
 
     def _disable_persistence(self, error: BaseException) -> None:
         self._disabled = True
@@ -371,12 +381,31 @@ class JevShadowRuntime:
     def enqueue(self, turn_id: str, turns: Sequence[Any], *, explicit_memory_request: bool) -> bool:
         import queue
         if self._stop.is_set() or self._disabled: return False
-        try:
-            if not self.store.reserve(turn_id): return False
-        except (ValueError, OSError) as exc:
-            self._disable_persistence(exc); return False
+        with self._admission_lock:
+            if turn_id in self._admitted:
+                return False
+            try:
+                existing = self.store.events() if hasattr(self.store, "events") else []
+                if any(event.get("turn_id") == turn_id for event in existing):
+                    return False
+                snapshot = self.store.snapshot() if hasattr(self.store, "snapshot") else None
+                if snapshot is not None and snapshot.valid_evaluations + len(self._admitted) >= self.store.target:
+                    self.store.append({"kind": "evaluation", "pilot_id": self.store.pilot_id,
+                                       "turn_id": turn_id, "valid": False,
+                                       "counts_toward_target": False,
+                                       "verdict": "shadow_fail_open", "model": None,
+                                       "policy": self._policy_dict(), "latency_ms": 0,
+                                       "usage": {}, "error_code": "target_reached",
+                                       "fact_count": 0, "fact_types": []})
+                    return False
+                if not self.store.reserve(turn_id): return False
+            except (ValueError, OSError) as exc:
+                self._disable_persistence(exc); return False
+            self._admitted.add(turn_id)
         try: self._queue.put_nowait((turn_id, list(turns), explicit_memory_request))
-        except queue.Full: return False
+        except queue.Full:
+            with self._admission_lock: self._admitted.discard(turn_id)
+            return False
         self._ensure(); return True
 
     def _evaluate(self, turn_id: str, turns: list[Any], explicit: bool) -> None:
@@ -392,8 +421,10 @@ class JevShadowRuntime:
         except TimeoutError: event["error_code"] = "timeout"
         except Exception: event["error_code"] = "transport_error"
         event["latency_ms"] = int((time.monotonic() - start) * 1000)
-        try: self.store.append(event)
-        except (ValueError, OSError) as exc: self._disable_persistence(exc)
+        with self._admission_lock:
+            try: self.store.append(event)
+            except (ValueError, OSError) as exc: self._disable_persistence(exc)
+            finally: self._admitted.discard(turn_id)
 
     def _policy_dict(self) -> dict[str, Any]:
         return {"model": self.policy.model, "accepted_models": list(self.policy.accepted_models), "should_retain_threshold": self.policy.should_retain_threshold, "grounded_threshold": self.policy.grounded_threshold, "standalone_threshold": self.policy.standalone_threshold, "duplicate_threshold": self.policy.duplicate_threshold, "sensitive_threshold": self.policy.sensitive_threshold}
@@ -402,7 +433,7 @@ class JevShadowRuntime:
         if self._disabled: return
         try:
             if any(e.get("turn_id") == turn_id and e.get("kind") == "retain_outcome" for e in self.store.events()): return
-            self.store.append({"kind": "retain_outcome", "pilot_id": self.store.pilot_id, "turn_id": turn_id, "counts_toward_target": False, "status": outcome.status, "operation_ids_count": outcome.operation_ids_count, "result_items_count": outcome.result_items_count, "fact_count": outcome.fact_count, "fact_types": list(outcome.fact_types), "latency_ms": outcome.latency_ms, "error_code": outcome.error_code})
+            self.store.append({"kind": "retain_outcome", "pilot_id": self.store.pilot_id, "turn_id": turn_id, "counts_toward_target": False, "status": outcome.status, "operation_ids_count": outcome.operation_ids_count, "result_items_count": outcome.result_items_count, "fact_count": outcome.fact_count if outcome.fact_count is not None else 0, "fact_types": list(outcome.fact_types), "latency_ms": outcome.latency_ms, "error_code": outcome.error_code})
         except (ValueError, OSError) as exc: self._disable_persistence(exc)
 
     def shutdown(self, timeout: float = 1.0) -> None:
