@@ -129,15 +129,16 @@ def validate_shadow_response(payload: Mapping[str, Any], policy: ShadowPolicy) -
     return ShadowAnswers(noul("should_retain"), memory_kind, noul("user_grounded"), noul("standalone_meaning"), noul("likely_duplicate"), priority, noul("sensitive"))
 
 
-def derive_shadow_verdict(answers: ShadowAnswers, *, explicit_memory_request: bool, excluded_content: bool) -> str:
-    if excluded_content or answers.sensitive >= 0.5:
+def derive_shadow_verdict(answers: ShadowAnswers, *, policy: ShadowPolicy | None = None, explicit_memory_request: bool, excluded_content: bool) -> str:
+    policy = policy or ShadowPolicy()
+    if excluded_content or answers.sensitive >= policy.sensitive_threshold:
         return SHADOW_FAIL_OPEN
     if explicit_memory_request or answers.memory_kind in {"correction", "decision", "constraint"}:
         return SHADOW_RETAIN
-    if answers.should_retain >= 0.7 and answers.user_grounded >= 0.7 and answers.retention_priority == "retain_now" and answers.likely_duplicate < 0.8:
+    if answers.should_retain >= policy.should_retain_threshold and answers.user_grounded >= policy.grounded_threshold and answers.retention_priority == "retain_now" and answers.likely_duplicate < policy.duplicate_threshold and answers.standalone_meaning >= policy.standalone_threshold:
         return SHADOW_RETAIN
-    if answers.retention_priority == "skip" and answers.should_retain < 0.4 and answers.memory_kind == "none":
+    if answers.retention_priority == "skip" and answers.should_retain < policy.should_retain_threshold and answers.memory_kind == "none":
         return SHADOW_SKIP
-    if answers.should_retain >= 0.4 or answers.retention_priority == "buffer" or answers.standalone_meaning < 0.6:
+    if answers.should_retain >= policy.should_retain_threshold or answers.retention_priority == "buffer" or answers.standalone_meaning < policy.standalone_threshold:
         return SHADOW_BUFFER
     return SHADOW_FAIL_OPEN

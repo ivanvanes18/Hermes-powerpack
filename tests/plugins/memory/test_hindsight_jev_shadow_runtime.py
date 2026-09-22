@@ -1,5 +1,7 @@
 import threading
 import time
+import multiprocessing
+import os
 
 import pytest
 
@@ -70,10 +72,62 @@ def test_runtime_stops_at_one_hundred_and_records_provider_failure(tmp_path):
     assert runtime.enqueue("failure", [ShadowTurn("u", "a")], explicit_memory_request=False)
     runtime.shutdown(2)
     assert store.snapshot().valid_evaluations == 0
-    assert store.events()[0]["verdict"] == "shadow_fail_open"
+    assert next(e for e in store.events() if e["kind"] == "evaluation")["verdict"] == "shadow_fail_open"
     transport = FakeTransport(payload=response_payload())
     runtime = JevShadowRuntime(ShadowRuntimeConfig(pilot_id="p2", max_queue=128), ShadowEventStore(tmp_path / "pilot2", "p2"), transport)
     for i in range(100): runtime.enqueue(f"v{i}", [ShadowTurn("u", "a")], explicit_memory_request=False)
     runtime.shutdown(3)
     assert runtime.store.snapshot().valid_evaluations == 100
     assert runtime.enqueue("v100", [ShadowTurn("u", "a")], explicit_memory_request=False) is False
+
+
+def test_store_allows_evaluation_and_retain_outcome_for_same_turn(tmp_path):
+    from plugins.memory.hindsight.jev_shadow_runtime import ShadowEventStore
+    store = ShadowEventStore(tmp_path / "pilot", "p1")
+    assert store.reserve("same")
+    store.append({"kind": "evaluation", "pilot_id": "p1", "turn_id": "same",
+                  "counts_toward_target": True, "valid": True,
+                  "verdict": "shadow_retain", "model": "jev-latest"})
+    store.append({"kind": "retain_outcome", "pilot_id": "p1", "turn_id": "same",
+                  "counts_toward_target": False, "status": "succeeded",
+                  "operation_ids_count": 1})
+    assert len(store.events()) == 3  # durable reservation + two event kinds
+
+
+def test_store_is_exactly_bounded_under_threads_and_processes(tmp_path):
+    from plugins.memory.hindsight.jev_shadow_runtime import ShadowEventStore
+    root = tmp_path / "pilot"
+    ShadowEventStore(root, "p1")
+    def add(i):
+        store = ShadowEventStore(root, "p1")
+        if store.reserve(f"t{i}"):
+            store.append({"kind": "evaluation", "pilot_id": "p1", "turn_id": f"t{i}",
+                          "counts_toward_target": True, "valid": True,
+                          "verdict": "shadow_retain", "model": "jev-latest"})
+    threads = [threading.Thread(target=add, args=(i,)) for i in range(60)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    procs = [multiprocessing.Process(target=add, args=(60 + i,)) for i in range(60)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    store = ShadowEventStore(root, "p1")
+    evaluations = [e for e in store.events() if e.get("kind") == "evaluation"]
+    assert len(evaluations) == 100
+    assert store.snapshot().valid_evaluations == 100
+    assert store.snapshot().terminal_state == "pending_analysis"
+
+
+def test_store_rejects_rebound_root_and_digest_tampering(tmp_path):
+    from plugins.memory.hindsight.jev_shadow_runtime import ShadowEventStore
+    root = tmp_path / "pilot"
+    store = ShadowEventStore(root, "p1")
+    store.append({"kind": "evaluation", "pilot_id": "p1", "turn_id": "t1",
+                  "counts_toward_target": True, "valid": True,
+                  "verdict": "shadow_retain", "model": "jev-latest"})
+    state = root / "state.json"
+    state.write_text(state.read_text().replace('"event_count":1', '"event_count":99'))
+    with pytest.raises(ValueError): ShadowEventStore(root, "p1")
+    other = tmp_path / "other"; other.mkdir()
+    root.rename(tmp_path / "moved")
+    root.symlink_to(other, target_is_directory=True)
+    with pytest.raises(ValueError): ShadowEventStore(root, "p1")

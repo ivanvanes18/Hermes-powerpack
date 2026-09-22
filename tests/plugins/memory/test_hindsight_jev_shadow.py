@@ -80,6 +80,29 @@ def test_verdict_buffer_and_skip():
     assert derive_shadow_verdict(validate_shadow_response(payload, ShadowPolicy()), explicit_memory_request=False, excluded_content=False) == "shadow_skip"
 
 
+def test_verdict_uses_every_policy_threshold():
+    answers = validate_shadow_response(valid_response(), ShadowPolicy())
+    strict = ShadowPolicy(should_retain_threshold=.95, grounded_threshold=.95,
+                          standalone_threshold=.95, duplicate_threshold=.05,
+                          sensitive_threshold=.01)
+    assert derive_shadow_verdict(answers, policy=strict, explicit_memory_request=False,
+                                 excluded_content=False) == "shadow_buffer"
+
+
+def test_event_kinds_join_on_turn_id_without_rejecting_retain_outcome(tmp_path):
+    store = ShadowEventStore(tmp_path / "pilot", "p1")
+    store.append(sample_event())
+    store.append({"kind": "retain_outcome", "pilot_id": "p1", "ordinal": 2,
+                  "turn_id": "t1", "counts_toward_target": False,
+                  "status": "succeeded", "operation_ids_count": 1,
+                  "result_items_count": 1, "fact_count": 1,
+                  "fact_types": ["preference"], "latency_ms": 4,
+                  "error_code": None})
+    report = build_report(store.events())
+    assert report["retain_outcomes"]["succeeded"] == 1
+    assert report["eligibility_cross_tab"]["eligible_and_succeeded"] == 1
+
+
 def sample_event(ordinal=1, turn_id=None, verdict="shadow_retain"):
     return {"kind": "evaluation", "pilot_id": "p1", "ordinal": ordinal, "turn_id": turn_id or f"t{ordinal}", "valid": True, "counts_toward_target": True, "verdict": verdict, "model": "jev-latest", "latency_ms": 10, "usage": {"input_tokens": 3, "output_tokens": 2, "cost": 0.1}, "error_code": None, "fact_types": ["preference"], "fact_count": 1}
 
@@ -106,3 +129,9 @@ def test_report_reconciles_counts_and_collecting_status():
     assert report["status"] == "collecting"
     assert report["valid_evaluations"] == 2
     assert report["verdict_counts"] == {"shadow_retain": 1, "shadow_buffer": 0, "shadow_skip": 1, "shadow_fail_open": 0}
+
+
+def test_report_rejects_malformed_and_duplicate_event_kinds():
+    event = sample_event()
+    with pytest.raises(ValueError): build_report([{**event, "verdict": "not-a-verdict"}])
+    with pytest.raises(ValueError): build_report([event, {**event, "ordinal": 2}])
