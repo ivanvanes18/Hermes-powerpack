@@ -984,6 +984,45 @@ class TestSyncTurn:
         provider._retain_queue.join()
         provider._client.aretain_batch.assert_awaited_once()
 
+    def test_jev_shadow_persists_only_terminal_retain_outcomes(self, provider):
+        class Shadow:
+            def __init__(self):
+                self.outcomes = []
+
+            def enqueue(self, *args, **kwargs):
+                return True
+
+            def record_retain_outcome(self, turn_id, outcome):
+                self.outcomes.append((turn_id, outcome))
+
+        shadow = Shadow()
+        provider._jev_shadow_runtime = shadow
+        provider._client.aretain_batch.return_value = SimpleNamespace(
+            operation_id="op-success", operation_ids=None
+        )
+
+        provider.sync_turn("hello", "world")
+        provider._retain_queue.join()
+
+        assert provider._client.aretain_batch.await_count == 1
+        assert len(shadow.outcomes) == 1
+        success_turn_id, success = shadow.outcomes[0]
+        assert success_turn_id.startswith("reina-1-")
+        assert success.status == "succeeded"
+        assert success.operation_ids_count == 1
+        assert success.error_code is None
+
+        provider._client.aretain_batch.side_effect = RuntimeError("hindsight unavailable")
+        provider.sync_turn("again", "later")
+        provider._retain_queue.join()
+
+        assert provider._client.aretain_batch.await_count == 2
+        assert [outcome.status for _, outcome in shadow.outcomes] == [
+            "succeeded", "failed"
+        ]
+        assert shadow.outcomes[1][0].startswith("reina-2-")
+        assert shadow.outcomes[1][1].error_code == "retain_error"
+
     def test_jev_shadow_success_preserves_exact_retain_payload(self, provider):
         baseline = _make_mock_client()
         provider._client = baseline

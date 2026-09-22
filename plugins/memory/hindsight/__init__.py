@@ -1101,7 +1101,6 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception:
                 logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
         self._enqueue_retain(job)
-        self._record_jev_retain_outcome(shadow_turn_id, "queued", time.monotonic())
         # Advance the watermark only after the delta is queued so a later retain
         # doesn't re-ship turns already handed to the writer.
         if update_mode == "append":
