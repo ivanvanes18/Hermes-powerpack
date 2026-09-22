@@ -1119,7 +1119,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._jev_shadow_runtime = None
         if not bool(self._config.get("jev_shadow_enabled", False)):
             return
-        if self._agent_identity.casefold() not in {"", "reina"}:
+        # Hermes names the primary profile ``default``; on Ivan's runtime that
+        # profile is Reina. Other named profiles (including Zoya) remain closed.
+        if str(getattr(self, "_agent_identity", "")).casefold() not in {"", "reina", "default"}:
             logger.warning("Jev shadow disabled: non-Reina agent identity")
             return
         api_key = get_secret("TYPESAFE_API_KEY", "")

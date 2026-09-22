@@ -153,6 +153,26 @@ def test_jev_shadow_uses_official_typesafe_default_and_preserves_overrides(tmp_p
     assert transports[-1][0] == "https://override.example"
 
 
+def test_jev_shadow_admits_default_profile_as_reina(tmp_path, monkeypatch):
+    from plugins.memory.hindsight import jev_shadow_runtime as runtime_module
+
+    created = []
+
+    class SpyRuntime:
+        def __init__(self, *args):
+            created.append(args)
+
+    monkeypatch.setattr(runtime_module, "JevShadowRuntime", SpyRuntime)
+    monkeypatch.setattr("plugins.memory.hindsight.get_secret", lambda name, default="": "test-key")
+
+    provider = HindsightMemoryProvider()
+    provider._config = {"jev_shadow_enabled": True, "jev_shadow_root": str(tmp_path)}
+    setattr(provider, "_agent_identity", "default")
+    provider._initialize_jev_shadow(str(tmp_path))
+
+    assert len(created) == 1
+
+
 def _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, mode: str):
     """Cloud/local-external clients must ensure lazy deps before importing."""
     import builtins
