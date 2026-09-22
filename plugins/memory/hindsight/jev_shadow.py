@@ -103,8 +103,16 @@ def _probability(value: Any) -> float:
 
 
 def _choice(answer: Any, options: set[str]) -> tuple[str, Mapping[str, Any]]:
-    if not isinstance(answer, Mapping) or set(answer) != {"choice", "probabilities"} or answer["choice"] not in options or not isinstance(answer["probabilities"], Mapping) or set(answer["probabilities"]) != options:
+    if (
+        not isinstance(answer, Mapping)
+        or set(answer) != {"choice", "confidence", "probabilities", "type"}
+        or answer["type"] != "choice"
+        or answer["choice"] not in options
+        or not isinstance(answer["probabilities"], Mapping)
+        or set(answer["probabilities"]) != options
+    ):
         raise ShadowContractError("choice_invalid")
+    _probability(answer["confidence"])
     probabilities = {key: _probability(value) for key, value in answer["probabilities"].items()}
     if abs(sum(probabilities.values()) - 1.0) > 1e-6:
         raise ShadowContractError("probability_sum_invalid")
@@ -130,7 +138,7 @@ def validate_shadow_response(payload: Mapping[str, Any], policy: ShadowPolicy) -
         raise ShadowContractError("answer_missing" if missing else "answer_unknown")
     def noul(name: str) -> float:
         item = answers[name]
-        if not isinstance(item, Mapping) or set(item) != {"noul"}:
+        if not isinstance(item, Mapping) or set(item) != {"noul", "type"} or item["type"] != "noul":
             raise ShadowContractError("answer_type_invalid")
         return _probability(item["noul"])
     memory_kind, _ = _choice(answers["memory_kind"], set(QUESTIONS["memory_kind"]["criteria"]))

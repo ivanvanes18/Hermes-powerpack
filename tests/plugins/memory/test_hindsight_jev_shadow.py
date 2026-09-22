@@ -55,11 +55,11 @@ def test_build_shadow_request_redacts_and_blocks_excluded_content():
 
 def valid_response(model="jev-latest"):
     return {"model": model, "answers": {
-        "should_retain": {"noul": 0.9},
-        "memory_kind": {"choice": "preference", "probabilities": {"preference": 1.0, "decision": 0.0, "constraint": 0.0, "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 0.0}},
-        "user_grounded": {"noul": 0.9}, "standalone_meaning": {"noul": 0.9}, "likely_duplicate": {"noul": 0.1},
-        "retention_priority": {"choice": "retain_now", "probabilities": {"skip": 0.0, "buffer": 0.0, "retain_now": 1.0}},
-        "sensitive": {"noul": 0.0},
+        "should_retain": {"noul": 0.9, "type": "noul"},
+        "memory_kind": {"choice": "preference", "confidence": 1.0, "probabilities": {"preference": 1.0, "decision": 0.0, "constraint": 0.0, "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 0.0}, "type": "choice"},
+        "user_grounded": {"noul": 0.9, "type": "noul"}, "standalone_meaning": {"noul": 0.9, "type": "noul"}, "likely_duplicate": {"noul": 0.1, "type": "noul"},
+        "retention_priority": {"choice": "retain_now", "confidence": 1.0, "probabilities": {"skip": 0.0, "buffer": 0.0, "retain_now": 1.0}, "type": "choice"},
+        "sensitive": {"noul": 0.0, "type": "noul"},
     }}
 
 
@@ -84,6 +84,21 @@ def test_validate_shadow_response_returns_typed_answers():
     assert answers.should_retain == pytest.approx(0.9)
 
 
+@pytest.mark.parametrize("mutator", [
+    lambda p: p["answers"]["should_retain"].pop("type"),
+    lambda p: p["answers"]["should_retain"].update(type="choice"),
+    lambda p: p["answers"]["memory_kind"].pop("confidence"),
+    lambda p: p["answers"]["memory_kind"].update(confidence=1.1),
+    lambda p: p["answers"]["memory_kind"].update(type="noul"),
+    lambda p: p["answers"]["memory_kind"].update(extra=True),
+])
+def test_validate_shadow_response_rejects_non_official_answer_shapes(mutator):
+    payload = valid_response()
+    mutator(payload)
+    with pytest.raises(ShadowContractError):
+        validate_shadow_response(payload, ShadowPolicy())
+
+
 def test_verdict_fail_open_precedes_skip_and_explicit_memory_retain():
     answers = validate_shadow_response(valid_response(), ShadowPolicy())
     assert derive_shadow_verdict(answers, explicit_memory_request=False, excluded_content=True) == "shadow_fail_open"
@@ -92,10 +107,10 @@ def test_verdict_fail_open_precedes_skip_and_explicit_memory_retain():
 
 def test_verdict_buffer_and_skip():
     payload = valid_response(); payload["answers"]["should_retain"]["noul"] = 0.4; payload["answers"]["standalone_meaning"]["noul"] = 0.3
-    payload["answers"]["retention_priority"] = {"choice": "buffer", "probabilities": {"skip": 0.0, "buffer": 1.0, "retain_now": 0.0}}
+    payload["answers"]["retention_priority"] = {"choice": "buffer", "confidence": 1.0, "probabilities": {"skip": 0.0, "buffer": 1.0, "retain_now": 0.0}, "type": "choice"}
     assert derive_shadow_verdict(validate_shadow_response(payload, ShadowPolicy()), explicit_memory_request=False, excluded_content=False) == "shadow_buffer"
-    payload["answers"]["memory_kind"] = {"choice": "none", "probabilities": {"preference": 0.0, "decision": 0.0, "constraint": 0.0, "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 1.0}}
-    payload["answers"]["should_retain"]["noul"] = 0.01; payload["answers"]["retention_priority"] = {"choice": "skip", "probabilities": {"skip": 1.0, "buffer": 0.0, "retain_now": 0.0}}
+    payload["answers"]["memory_kind"] = {"choice": "none", "confidence": 1.0, "probabilities": {"preference": 0.0, "decision": 0.0, "constraint": 0.0, "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 1.0}, "type": "choice"}
+    payload["answers"]["should_retain"]["noul"] = 0.01; payload["answers"]["retention_priority"] = {"choice": "skip", "confidence": 1.0, "probabilities": {"skip": 1.0, "buffer": 0.0, "retain_now": 0.0}, "type": "choice"}
     assert derive_shadow_verdict(validate_shadow_response(payload, ShadowPolicy()), explicit_memory_request=False, excluded_content=False) == "shadow_skip"
 
 

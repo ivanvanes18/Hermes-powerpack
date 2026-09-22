@@ -17,10 +17,10 @@ from plugins.memory.hindsight.jev_shadow_runtime import (
 
 def response_payload():
     return {"model": "jev-latest", "answers": {
-        "should_retain": {"noul": 0.9},
-        "memory_kind": {"choice": "preference", "probabilities": {"preference": 1.0, "decision": 0.0, "constraint": 0.0, "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 0.0}},
-        "user_grounded": {"noul": 0.9}, "standalone_meaning": {"noul": 0.9}, "likely_duplicate": {"noul": 0.0},
-        "retention_priority": {"choice": "retain_now", "probabilities": {"skip": 0.0, "buffer": 0.0, "retain_now": 1.0}}, "sensitive": {"noul": 0.0},
+        "should_retain": {"noul": 0.9, "type": "noul"},
+        "memory_kind": {"choice": "preference", "confidence": 1.0, "probabilities": {"preference": 1.0, "decision": 0.0, "constraint": 0.0, "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 0.0}, "type": "choice"},
+        "user_grounded": {"noul": 0.9, "type": "noul"}, "standalone_meaning": {"noul": 0.9, "type": "noul"}, "likely_duplicate": {"noul": 0.0, "type": "noul"},
+        "retention_priority": {"choice": "retain_now", "confidence": 1.0, "probabilities": {"skip": 0.0, "buffer": 0.0, "retain_now": 1.0}, "type": "choice"}, "sensitive": {"noul": 0.0, "type": "noul"},
     }}
 
 class FakeTransport:
