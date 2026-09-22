@@ -5,6 +5,7 @@ from plugins.memory.config_schema import (
     KIND_SELECT,
     get_provider_config_schema,
 )
+from plugins.memory.hindsight import HindsightMemoryProvider
 
 
 def test_hindsight_is_declared():
@@ -49,3 +50,18 @@ def test_api_key_is_a_secret_bound_to_env():
     assert api_key.kind == KIND_SECRET
     assert api_key.is_secret is True
     assert api_key.env_key == "HINDSIGHT_API_KEY"
+
+
+def test_jev_shadow_defaults_are_declared_on_provider_schema():
+    fields = {
+        field["key"]: field
+        for field in HindsightMemoryProvider().get_config_schema()
+        if field["key"].startswith("jev_shadow_")
+    }
+    assert {"jev_shadow_enabled", "jev_shadow_model", "jev_shadow_target", "jev_shadow_timeout", "jev_shadow_max_queue", "jev_shadow_root"} <= fields.keys()
+    assert fields["jev_shadow_enabled"]["default"] is False
+    assert fields["jev_shadow_model"]["default"] == "jev-latest"
+    assert fields["jev_shadow_target"]["default"] == 100
+    assert fields["jev_shadow_timeout"]["default"] == 10.0
+    assert fields["jev_shadow_max_queue"]["default"] == 32
+    assert fields["jev_shadow_root"]["default"] == ""

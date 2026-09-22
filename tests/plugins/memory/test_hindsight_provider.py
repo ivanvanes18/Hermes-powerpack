@@ -968,6 +968,50 @@ class TestRecallStatus:
 
 
 class TestSyncTurn:
+    @pytest.mark.parametrize("enqueue_result", [False, None])
+    def test_jev_shadow_cannot_change_retain_dispatch(self, provider, enqueue_result):
+        class Shadow:
+            def enqueue(self, *args, **kwargs):
+                if enqueue_result is None:
+                    raise TimeoutError("shadow timeout")
+                return enqueue_result
+
+            def record_retain_outcome(self, *args, **kwargs):
+                raise RuntimeError("correlation failure")
+
+        provider._jev_shadow_runtime = Shadow()
+        provider.sync_turn("hello", "world")
+        provider._retain_queue.join()
+        provider._client.aretain_batch.assert_awaited_once()
+
+    def test_jev_shadow_success_preserves_exact_retain_payload(self, provider):
+        baseline = _make_mock_client()
+        provider._client = baseline
+        provider.sync_turn("hello", "world")
+        provider._retain_queue.join()
+        expected = baseline.aretain_batch.call_args
+
+        provider._client.reset_mock()
+        class Shadow:
+            def enqueue(self, *args, **kwargs):
+                return True
+            def record_retain_outcome(self, *args, **kwargs):
+                return None
+
+        provider._jev_shadow_runtime = Shadow()
+        provider._session_turns = []
+        provider._turn_counter = provider._turn_index = provider._last_retained_turn_count = 0
+        provider.sync_turn("hello", "world")
+        provider._retain_queue.join()
+        actual = provider._client.aretain_batch.call_args
+        assert actual.kwargs["bank_id"] == expected.kwargs["bank_id"]
+        assert actual.kwargs["document_id"] == expected.kwargs["document_id"]
+        assert actual.kwargs["retain_async"] == expected.kwargs["retain_async"]
+        expected_item = dict(expected.kwargs["items"][0]); actual_item = dict(actual.kwargs["items"][0])
+        expected_item["metadata"] = dict(expected_item["metadata"]); actual_item["metadata"] = dict(actual_item["metadata"])
+        expected_item["metadata"].pop("retained_at", None); actual_item["metadata"].pop("retained_at", None)
+        assert actual_item["content"] == expected_item["content"]
+
     def test_sync_turn_retains_metadata_rich_turn(self, provider_with_config, monkeypatch):
         event_time = datetime(2026, 8, 10, 11, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
         monkeypatch.setattr("plugins.memory.hindsight._hermes_now", lambda: event_time)

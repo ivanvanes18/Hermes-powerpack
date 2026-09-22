@@ -14,10 +14,12 @@ import asyncio
 import atexit
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 import os
 import queue
+import secrets
 import sys
 import threading
 import time
@@ -376,6 +378,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._pending_retain_ops: set[str] = set()
         self._pending_retain_ops_lock = threading.Lock()
         self._retain_ops_bank_id = ""
+        self._shadow_turns: list[tuple[str, str]] = []
+        self._shadow_session_salt = secrets.token_bytes(16)
+        self._jev_shadow_runtime = None
         self._apply_retain_policy({})
 
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
@@ -478,6 +483,12 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
             {"key": "port_health_grace_timeout", "description": "Seconds to wait for a slow daemon /health before treating it as stale (raise on busy/low-resource hosts; blank uses the 30s default)", "default": "", "when": {"mode": "local_embedded"}},
+            {"key": "jev_shadow_enabled", "description": "Run the Reina-only Jev shadow observer without affecting Hindsight retains", "default": False},
+            {"key": "jev_shadow_model", "description": "Jev shadow model", "default": "jev-latest"},
+            {"key": "jev_shadow_target", "description": "Fixed Jev shadow pilot target", "default": 100},
+            {"key": "jev_shadow_timeout", "description": "Jev shadow request timeout in seconds", "default": 10.0},
+            {"key": "jev_shadow_max_queue", "description": "Maximum queued Jev shadow evaluations", "default": 32},
+            {"key": "jev_shadow_root", "description": "Private Jev shadow artifact root (empty uses HERMES_HOME/hindsight/jev-shadow)", "default": ""},
         ]
 
     # -- client -------------------------------------------------------------
@@ -723,6 +734,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._apply_connection_settings(cfg)
         self._apply_retain_settings(cfg)
         self._apply_recall_settings(cfg)
+        self._initialize_jev_shadow(kwargs.get("hermes_home"))
 
         client_version = "unknown"
         with contextlib.suppress(Exception):
@@ -1015,7 +1027,7 @@ class HindsightMemoryProvider(MemoryProvider):
         return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs))
 
     def _make_turn_retain_job(self, turns: list[str], *, document_id: str, update_mode: str | None,
-                              label: str, track_ops: bool = True) -> Callable[[], None]:
+                              label: str, track_ops: bool = True, shadow_turn_id: str | None = None) -> Callable[[], None]:
         """Writer job shipping *turns* as one document. Inputs are snapshotted NOW: the
         writer runs after later sync_turn() calls mutate _session_turns/_turn_index/_session_id."""
         content = "[" + ",".join(turns) + "]"
@@ -1029,11 +1041,20 @@ class HindsightMemoryProvider(MemoryProvider):
                                              tags=tags, update_mode=update_mode)
             logger.debug("Hindsight %s: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
                          label, bank_id, document_id, update_mode, retain_async, len(content), len(turns))
-            resp = self._retain_batch(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async)
+            started = time.monotonic()
+            try:
+                resp = self._retain_batch(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async)
+            except Exception:
+                if shadow_turn_id:
+                    self._record_jev_retain_outcome(shadow_turn_id, "failed", started, error_code="retain_error")
+                raise
             # Async retains are only *accepted* here; track the op id(s) so the
             # next-turn prefetch can wait for true server-side completion.
             if retain_async and track_ops:
                 self._track_retain_ops(resp, bank_id)
+            if shadow_turn_id:
+                self._record_jev_retain_outcome(shadow_turn_id, "succeeded", started,
+                                                operation_ids_count=(1 if retain_async and getattr(resp, "operation_id", None) else 0))
             logger.debug("Hindsight %s succeeded", label)
 
         return _job
@@ -1049,7 +1070,11 @@ class HindsightMemoryProvider(MemoryProvider):
             self._session_id = str(session_id).strip()
 
         self._session_turns.append(json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False))
+        self._shadow_turns.append((str(user_content), str(assistant_content)))
+        self._shadow_turns = self._shadow_turns[-3:]
         self._turn_counter = self._turn_index = self._turn_counter + 1
+        shadow_turn_id = self._shadow_turn_id(self._turn_counter)
+        self._enqueue_jev_shadow(shadow_turn_id)
         if remainder := self._turn_counter % self._retain_every_n_turns:
             logger.debug("sync_turn: buffered turn %d (will retain at turn %d)",
                          self._turn_counter, self._turn_counter + (self._retain_every_n_turns - remainder))
@@ -1067,7 +1092,7 @@ class HindsightMemoryProvider(MemoryProvider):
                      len(turns_to_retain), len(self._session_turns), sum(len(t) for t in turns_to_retain))
 
         job = self._make_turn_retain_job(turns_to_retain, document_id=document_id,
-                                         update_mode=update_mode, label="retain")
+                                         update_mode=update_mode, label="retain", shadow_turn_id=shadow_turn_id)
         # Indicator fires only past every skip/buffer gate: solely on turns that persist.
         # Model-independent status line; no-op without retain_indicator/status channel.
         if self._retain_indicator and self._status_callback is not None:
@@ -1076,10 +1101,67 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception:
                 logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
         self._enqueue_retain(job)
+        self._record_jev_retain_outcome(shadow_turn_id, "queued", time.monotonic())
         # Advance the watermark only after the delta is queued so a later retain
         # doesn't re-ship turns already handed to the writer.
         if update_mode == "append":
             self._last_retained_turn_count = len(self._session_turns)
+
+    def _initialize_jev_shadow(self, hermes_home: str | None) -> None:
+        self._jev_shadow_runtime = None
+        if not bool(self._config.get("jev_shadow_enabled", False)):
+            return
+        if self._agent_identity.casefold() not in {"", "reina"}:
+            logger.warning("Jev shadow disabled: non-Reina agent identity")
+            return
+        api_key = get_secret("TYPESAFE_API_KEY", "")
+        if not api_key:
+            logger.warning("Jev shadow disabled: TYPESAFE_API_KEY is unavailable")
+            return
+        try:
+            from .jev_shadow import ShadowPolicy
+            from .jev_shadow_runtime import JevShadowRuntime, ShadowEventStore, ShadowRuntimeConfig, TypeSafeTransport
+            target = int(self._config.get("jev_shadow_target", 100))
+            root_value = self._config.get("jev_shadow_root") or ""
+            root = Path(root_value) if root_value else Path(hermes_home or get_hermes_home()) / "hindsight" / "jev-shadow"
+            store = ShadowEventStore(root, pilot_id="reina", target=target)
+            if store.snapshot().valid_evaluations >= target:
+                return
+            model = str(self._config.get("jev_shadow_model", "jev-latest"))
+            timeout = float(self._config.get("jev_shadow_timeout", 10.0))
+            max_queue = max(1, int(self._config.get("jev_shadow_max_queue", 32)))
+            policy = ShadowPolicy(model=model, accepted_models=(model,))
+            endpoint = self._config.get("typesafe_endpoint") or os.environ.get("TYPESAFE_API_URL", "https://api.typesafe.ai")
+            self._jev_shadow_runtime = JevShadowRuntime(
+                ShadowRuntimeConfig(pilot_id="reina", policy=policy, max_queue=max_queue, timeout=timeout),
+                store, TypeSafeTransport(endpoint, api_key, timeout),
+            )
+        except Exception as exc:
+            logger.warning("Jev shadow disabled during initialization (%s)", type(exc).__name__)
+
+    def _shadow_turn_id(self, turn_index: int) -> str:
+        digest = hashlib.sha256(self._shadow_session_salt + str(turn_index).encode()).hexdigest()
+        return f"reina-{turn_index}-{digest[:24]}"
+
+    def _enqueue_jev_shadow(self, turn_id: str) -> None:
+        runtime = self._jev_shadow_runtime
+        if runtime is None:
+            return
+        try:
+            from .jev_shadow import ShadowTurn
+            runtime.enqueue(turn_id, [ShadowTurn(user, assistant) for user, assistant in self._shadow_turns], explicit_memory_request=False)
+        except Exception:
+            logger.debug("Jev shadow enqueue failed (non-fatal)", exc_info=True)
+
+    def _record_jev_retain_outcome(self, turn_id: str, status: str, started: float, *, operation_ids_count: int = 0, error_code: str | None = None) -> None:
+        runtime = self._jev_shadow_runtime
+        if runtime is None:
+            return
+        try:
+            from .jev_shadow_runtime import RetainOutcome
+            runtime.record_retain_outcome(turn_id, RetainOutcome(status=status, operation_ids_count=operation_ids_count, latency_ms=int((time.monotonic() - started) * 1000), error_code=error_code))
+        except Exception:
+            logger.debug("Jev shadow retain correlation failed (non-fatal)", exc_info=True)
 
     def _enqueue_retain(self, job: Callable[[], None]) -> None:
         """Hand *job* to the (lazily started) writer and arm the atexit drain."""
@@ -1194,6 +1276,8 @@ class HindsightMemoryProvider(MemoryProvider):
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
         self._session_turns = []
+        self._shadow_turns = []
+        self._shadow_session_salt = secrets.token_bytes(16)
         self._turn_counter = self._turn_index = self._last_retained_turn_count = 0
         logger.debug("Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
                      self._session_id, self._parent_session_id, reset, self._document_id)
@@ -1226,6 +1310,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.warning("Hindsight writer did not stop within 10s; abandoning %d pending retain(s)",
                                self._retain_queue.qsize())
         self._join_prefetch(5.0)
+        if self._jev_shadow_runtime is not None:
+            with contextlib.suppress(Exception):
+                self._jev_shadow_runtime.shutdown(timeout=2.0)
         if self._client is not None:
             with contextlib.suppress(Exception):
                 self._close_client()
