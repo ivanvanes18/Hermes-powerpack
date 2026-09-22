@@ -4,6 +4,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -18,6 +19,9 @@ from typing import Any, Mapping, Sequence
 _FORBIDDEN_KEYS = {"user_text", "assistant_text", "state", "request", "response", "content", "prompt"}
 _SECRET_RE = re.compile(r"(?i)(sk[_-]|jv_live_|bearer\s|private key|password\s*=)")
 _EVENT_KINDS = {"reservation", "evaluation", "retain_outcome"}
+_LOGGER = logging.getLogger(__name__)
+_PROCESS_LOCKS: dict[str, threading.Lock] = {}
+_PROCESS_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -29,22 +33,24 @@ class PilotSnapshot:
     terminal_state: str
 
 
-def _validate_parents(path: Path) -> None:
+def _open_directory_chain(path: Path) -> int:
+    """Open/create a directory path one component at a time, without lookup races."""
     path = path.absolute()
-    existing: list[Path] = []
-    current = path
-    while True:
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            current = current.parent
-            continue
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise ValueError("parent_unsafe")
-        existing.append(current)
-        if current == current.parent:
-            break
-        current = current.parent
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(os.sep, flags)
+    try:
+        for component in path.parts[1:]:
+            try:
+                child = os.open(component, flags, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(component, 0o700, dir_fd=fd)
+                child = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 class ShadowEventStore:
@@ -53,21 +59,28 @@ class ShadowEventStore:
             raise ValueError("target_invalid")
         if not isinstance(pilot_id, str) or not pilot_id:
             raise ValueError("pilot_invalid")
-        self.root = Path(root)
+        self.root = Path(root).absolute()
         self.pilot_id = pilot_id
         self.target = target
-        _validate_parents(self.root.parent)
-        if self.root.exists():
-            info = self.root.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise ValueError("root_unsafe")
-            if stat.S_IMODE(info.st_mode) != 0o700:
-                raise ValueError("root_unsafe")
-        else:
-            self.root.mkdir(mode=0o700)
-        os.chmod(self.root, 0o700)
+        with _PROCESS_LOCKS_GUARD:
+            self._process_lock = _PROCESS_LOCKS.setdefault(str(self.root), threading.Lock())
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-        self._root_fd = os.open(self.root, flags)
+        parent_fd = _open_directory_chain(self.root.parent)
+        try:
+            try:
+                self._root_fd = os.open(self.root.name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                os.mkdir(self.root.name, 0o700, dir_fd=parent_fd)
+                self._root_fd = os.open(self.root.name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                raise ValueError("root_unsafe") from exc
+        finally:
+            os.close(parent_fd)
+        info = os.fstat(self._root_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("root_unsafe")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(self._root_fd, 0o700)
         self._root_identity = os.fstat(self._root_fd)
         self.events_path = self.root / "events.jsonl"
         self.state_path = self.root / "state.json"
@@ -130,12 +143,18 @@ class ShadowEventStore:
         class Guard:
             def __init__(self, store: ShadowEventStore): self.store = store
             def __enter__(self):
-                self.store._check_root()
-                fcntl.flock(self.store._lock_fd, fcntl.LOCK_EX)
-                self.store._check_root()
-                return self.store
+                self.store._process_lock.acquire()
+                try:
+                    self.store._check_root()
+                    fcntl.flock(self.store._lock_fd, fcntl.LOCK_EX)
+                    self.store._check_root()
+                    return self.store
+                except BaseException:
+                    self.store._process_lock.release()
+                    raise
             def __exit__(self, *_):
                 fcntl.flock(self.store._lock_fd, fcntl.LOCK_UN)
+                self.store._process_lock.release()
         return Guard(self)
 
     def _read_bytes_locked(self, name: str) -> bytes:
@@ -329,7 +348,14 @@ class JevShadowRuntime:
         self._disabled = False; self._persistence_error: str | None = None
 
     def _disable_persistence(self, error: BaseException) -> None:
-        self._disabled = True; self._persistence_error = type(error).__name__
+        self._disabled = True
+        self._persistence_error = type(error).__name__
+        _LOGGER.warning("Jev shadow persistence disabled (%s)", self._persistence_error)
+
+    def status_snapshot(self) -> dict[str, Any]:
+        return {"disabled": self._disabled, "error_type": self._persistence_error,
+                "error_code": "persistence_error" if self._disabled else None,
+                "report_valid": not self._disabled}
 
     def _ensure(self) -> None:
         if self._thread is None:

@@ -52,6 +52,7 @@ def _validate_event(event: Mapping[str, Any], ordinal: int) -> None:
         _require(event.get("status") in RETAIN_STATUSES, "retain_status_invalid")
         _require(isinstance(event.get("fact_types", []), list), "fact_types_invalid")
         _require(all(isinstance(value, str) for value in event.get("fact_types", [])), "fact_types_invalid")
+        _require(isinstance(event.get("fact_count", 0), int) and event.get("fact_count", 0) >= 0, "fact_count_invalid")
         _require(event.get("counts_toward_target") is False, "reservation_count_invalid")
     else:
         _require(event.get("counts_toward_target") is False, "reservation_count_invalid")
@@ -92,10 +93,13 @@ def build_report(events: Sequence[Mapping[str, Any]], *, target: int = 100) -> d
                 if not isinstance(value[key], (int, float)) or isinstance(value[key], bool): raise ReportError("usage_invalid")
                 usage[key] += value[key]
     errors = Counter(event.get("error_code") for event in records if event.get("error_code"))
-    fact_types = Counter(ft for event in valid_evaluations for ft in event.get("fact_types", []))
-    false_skips = [event["turn_id"] for event in valid_evaluations if event["verdict"] == "shadow_skip" and event.get("fact_count", 0) > 0]
-    retain_counts = Counter(event["status"] for event in retain)
+    retain_by_turn = joined
     eligible = {event["turn_id"] for event in valid_evaluations if event["verdict"] in {"shadow_retain", "shadow_buffer"}}
+    eligible_missing = eligible - set(joined)
+    fact_types = Counter(ft for event in retain_by_turn.values() for ft in event.get("fact_types", []))
+    fact_count = sum(event.get("fact_count", 0) for event in retain_by_turn.values())
+    false_skips = [event["turn_id"] for event in valid_evaluations if event["verdict"] == "shadow_skip" and retain_by_turn.get(event["turn_id"], {}).get("fact_count", 0) > 0]
+    retain_counts = Counter(event["status"] for event in retain)
     succeeded = {turn_id for turn_id, event in joined.items() if event["status"] == "succeeded"}
     return {
         "status": "pending_analysis" if len(valid_evaluations) == target else "collecting",
@@ -104,9 +108,9 @@ def build_report(events: Sequence[Mapping[str, Any]], *, target: int = 100) -> d
         "models": sorted({event["model"] for event in valid_evaluations if event.get("model")}),
         "latency_ms": {"p50": _percentile(latencies, .5), "p95": _percentile(latencies, .95)},
         "usage": usage, "error_counts": dict(sorted(errors.items())), "candidate_false_skips": false_skips,
-        "retain_outcomes": {key: retain_counts.get(key, 0) for key in sorted(RETAIN_STATUSES)},
-        "fact_count": sum(event.get("fact_count", 0) for event in valid_evaluations),
+        "retain_outcomes": {key: retain_counts.get(key, 0) for key in sorted(RETAIN_STATUSES)} | {"missing": len(eligible_missing)},
+        "fact_count": fact_count,
         "fact_type_counts": dict(sorted(fact_types.items())),
         "failure_cross_tab": {key: sum(1 for event in evaluations if event.get("error_code") == key) for key in sorted(errors)},
-        "eligibility_cross_tab": {"eligible": len(eligible), "ineligible": len(valid_evaluations) - len(eligible), "eligible_and_succeeded": len(eligible & succeeded), "eligible_and_failed": len(eligible - succeeded)},
+        "eligibility_cross_tab": {"eligible": len(eligible), "ineligible": len(valid_evaluations) - len(eligible), "eligible_and_succeeded": len(eligible & succeeded), "eligible_and_failed": len(eligible & {turn_id for turn_id, event in joined.items() if event["status"] == "failed"}), "eligible_and_missing": len(eligible_missing)},
     }

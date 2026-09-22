@@ -14,30 +14,41 @@ from plugins.memory.hindsight.jev_shadow_report import ReportError, build_report
 from plugins.memory.hindsight.jev_shadow_runtime import ShadowEventStore
 
 
+def _open_parent(path: Path) -> int:
+    path = path.absolute()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(os.sep, flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise ReportError("output_parent_unsafe")
+
+
 def _safe_output(path: Path, payload: str) -> None:
-    parent = path.parent.absolute()
-    current = parent
-    while True:
-        info = current.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode): raise ReportError("output_parent_unsafe")
-        if current == current.parent: break
-        current = current.parent
-    if path.exists() or path.is_symlink():
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode): raise ReportError("output_unsafe")
-    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    path = path.absolute()
+    fd = _open_parent(path.parent)
     name = path.name
     tmp_name = f".{name}.{os.getpid()}.tmp"
+    temp_created = False
     try:
         out = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        temp_created = True
         try:
             os.write(out, payload.encode()); os.fsync(out); os.fchmod(out, 0o600)
         finally: os.close(out)
-        os.replace(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd)
+        os.link(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        os.unlink(tmp_name, dir_fd=fd)
+        temp_created = False
         os.fsync(fd)
     finally:
-        try: os.unlink(tmp_name, dir_fd=fd)
-        except FileNotFoundError: pass
+        if temp_created:
+            try: os.unlink(tmp_name, dir_fd=fd)
+            except FileNotFoundError: pass
         os.close(fd)
 
 

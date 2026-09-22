@@ -1,5 +1,6 @@
 import json
 import stat
+import os
 
 import pytest
 
@@ -101,6 +102,49 @@ def test_event_kinds_join_on_turn_id_without_rejecting_retain_outcome(tmp_path):
     report = build_report(store.events())
     assert report["retain_outcomes"]["succeeded"] == 1
     assert report["eligibility_cross_tab"]["eligible_and_succeeded"] == 1
+
+
+def test_report_uses_retain_metadata_and_distinguishes_missing_from_failed():
+    events = [sample_event(1), sample_event(2), sample_event(3)]
+    events[0]["fact_count"] = 99
+    events[0]["fact_types"] = ["evaluation_only"]
+    events.extend([
+        {"kind": "retain_outcome", "pilot_id": "p1", "ordinal": 4,
+         "turn_id": "t1", "counts_toward_target": False, "status": "succeeded",
+         "fact_count": 2, "fact_types": ["preference", "decision"]},
+        {"kind": "retain_outcome", "pilot_id": "p1", "ordinal": 5,
+         "turn_id": "t3", "counts_toward_target": False, "status": "failed",
+         "fact_count": 7, "fact_types": ["fact"]},
+    ])
+    report = build_report(events)
+    assert report["fact_count"] == 9
+    assert report["fact_type_counts"] == {"decision": 1, "fact": 1, "preference": 1}
+    assert report["retain_outcomes"] == {"failed": 1, "missing": 1, "queued": 0, "succeeded": 1}
+    assert report["eligibility_cross_tab"]["eligible_and_failed"] == 1
+    assert report["eligibility_cross_tab"]["eligible_and_missing"] == 1
+
+
+def test_report_rejects_negative_retain_fact_metadata():
+    event = sample_event()
+    event.update(kind="retain_outcome", ordinal=1, counts_toward_target=False,
+                 status="succeeded", fact_count=-1, fact_types=[])
+    with pytest.raises(ValueError):
+        build_report([event])
+
+
+def test_output_publication_never_clobbers_final_file(tmp_path, monkeypatch):
+    from scripts.jev_hindsight_shadow_report import _safe_output
+    output = tmp_path / "report.json"
+    original_link = os.link
+
+    def competing_link(*args, **kwargs):
+        output.write_text("competitor")
+        return original_link(*args, **kwargs)
+
+    monkeypatch.setattr(os, "link", competing_link)
+    with pytest.raises(FileExistsError):
+        _safe_output(output, "ours\n")
+    assert output.read_text() == "competitor"
 
 
 def sample_event(ordinal=1, turn_id=None, verdict="shadow_retain"):

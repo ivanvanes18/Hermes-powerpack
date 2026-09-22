@@ -2,6 +2,7 @@ import threading
 import time
 import multiprocessing
 import os
+import logging
 
 import pytest
 
@@ -131,3 +132,37 @@ def test_store_rejects_rebound_root_and_digest_tampering(tmp_path):
     root.rename(tmp_path / "moved")
     root.symlink_to(other, target_is_directory=True)
     with pytest.raises(ValueError): ShadowEventStore(root, "p1")
+
+
+def test_store_parent_substitution_during_root_creation_is_rejected(tmp_path, monkeypatch):
+    from plugins.memory.hindsight.jev_shadow_runtime import ShadowEventStore
+    parent = tmp_path / "parent"; parent.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    root = parent / "pilot"
+    from pathlib import Path
+    original_exists = Path.exists
+
+    def swap_parent(path):
+        if path == root:
+            parent.rename(tmp_path / "moved")
+            parent.symlink_to(outside, target_is_directory=True)
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", swap_parent)
+    ShadowEventStore(root, "p1")
+    assert not (outside / "pilot").exists()
+
+
+def test_runtime_exposes_sanitized_closed_persistence_status_and_logs(caplog):
+    class BrokenStore:
+        pilot_id = "p1"
+        def reserve(self, turn_id):
+            raise OSError("/secret/path: disk failed")
+
+    runtime = JevShadowRuntime(ShadowRuntimeConfig(pilot_id="p1"), BrokenStore(), FakeTransport())
+    with caplog.at_level(logging.WARNING):
+        assert runtime.enqueue("t1", [ShadowTurn("u", "a")], explicit_memory_request=False) is False
+    assert runtime.status_snapshot() == {"disabled": True, "error_type": "OSError", "error_code": "persistence_error", "report_valid": False}
+    assert "/secret" not in caplog.text
+    assert "disk failed" not in caplog.text
+    assert runtime.enqueue("t2", [ShadowTurn("u", "a")], explicit_memory_request=False) is False
