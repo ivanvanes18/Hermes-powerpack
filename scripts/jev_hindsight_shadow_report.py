@@ -35,20 +35,36 @@ def _safe_output(path: Path, payload: str) -> None:
     name = path.name
     tmp_name = f".{name}.{os.getpid()}.tmp"
     temp_created = False
-    try:
-        out = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
-        temp_created = True
+    temp_fd = None
+    temp_identity = None
+
+    def unlink_owned_temp() -> bool:
+        if not temp_created or temp_identity is None:
+            return False
         try:
-            os.write(out, payload.encode()); os.fsync(out); os.fchmod(out, 0o600)
-        finally: os.close(out)
-        os.link(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+            current = os.stat(tmp_name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if (current.st_dev, current.st_ino) != temp_identity:
+            return False
         os.unlink(tmp_name, dir_fd=fd)
-        temp_created = False
+        return True
+
+    try:
+        temp_fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        temp_created = True
+        created = os.fstat(temp_fd)
+        temp_identity = (created.st_dev, created.st_ino)
+        os.write(temp_fd, payload.encode()); os.fsync(temp_fd); os.fchmod(temp_fd, 0o600)
+        os.link(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        if unlink_owned_temp():
+            temp_created = False
         os.fsync(fd)
     finally:
         if temp_created:
-            try: os.unlink(tmp_name, dir_fd=fd)
-            except FileNotFoundError: pass
+            unlink_owned_temp()
+        if temp_fd is not None:
+            os.close(temp_fd)
         os.close(fd)
 
 

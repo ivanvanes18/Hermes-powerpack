@@ -147,6 +147,24 @@ def test_output_publication_never_clobbers_final_file(tmp_path, monkeypatch):
     assert output.read_text() == "competitor"
 
 
+def test_output_cleanup_preserves_substituted_temp_inode(tmp_path, monkeypatch):
+    from scripts.jev_hindsight_shadow_report import _safe_output
+    output = tmp_path / "report.json"
+    temp = tmp_path / f".{output.name}.{os.getpid()}.tmp"
+    original_link = os.link
+
+    def substitute_then_fail(*args, **kwargs):
+        original_link(*args, **kwargs)
+        temp.unlink()
+        temp.write_text("competitor")
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(os, "link", substitute_then_fail)
+    with pytest.raises(OSError, match="publication failed"):
+        _safe_output(output, "ours\n")
+    assert temp.read_text() == "competitor"
+
+
 def sample_event(ordinal=1, turn_id=None, verdict="shadow_retain"):
     return {"kind": "evaluation", "pilot_id": "p1", "ordinal": ordinal, "turn_id": turn_id or f"t{ordinal}", "valid": True, "counts_toward_target": True, "verdict": verdict, "model": "jev-latest", "latency_ms": 10, "usage": {"input_tokens": 3, "output_tokens": 2, "cost": 0.1}, "error_code": None, "fact_types": ["preference"], "fact_count": 1}
 

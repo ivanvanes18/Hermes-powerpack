@@ -67,3 +67,36 @@ exit 0
 - Fresh verification initially reproduced a same-process reservation/worker race as `JSONDecodeError`; a per-root in-process lock was added as the causal repair.
 - Repeated provider-failure/concurrency regression: 5 consecutive passes. Final focused suites: 27 passed; compileall and diff checks passed.
 - The correction wave remains intentionally limited to Tasks 1–3; provider-level causal proof and live runtime activation are out of scope and were not claimed.
+
+## Final report temp inode-ownership closure
+
+### Causal RED evidence
+
+The deterministic regression was added first and run before the production fix:
+
+```text
+uv run --with pytest python -m pytest -p no:cacheprovider --basetemp=/tmp/jev-shadow-red-inode tests/plugins/memory/test_hindsight_jev_shadow.py::test_output_cleanup_preserves_substituted_temp_inode -q
+1 failed
+```
+
+The test substitutes the deterministic temp pathname after publication's hard-link attempt and forces publication to fail. Before the fix, the unconditional cleanup unlinked the substitute and the assertion raised `FileNotFoundError`.
+
+### GREEN/final evidence
+
+The fix records the created temp FD's `(st_dev, st_ino)` identity and performs descriptor-relative `stat(..., follow_symlinks=False)` before cleanup; missing or mismatched entries are left untouched. The causal regression now passes:
+
+```text
+uv run --with pytest python -m pytest -p no:cacheprovider --basetemp=/tmp/jev-shadow-green-inode tests/plugins/memory/test_hindsight_jev_shadow.py::test_output_cleanup_preserves_substituted_temp_inode -q
+1 passed
+
+uv run --with pytest python -m pytest -p no:cacheprovider --basetemp=/tmp/jev-shadow-final-inode tests/plugins/memory/test_hindsight_jev_shadow.py tests/plugins/memory/test_hindsight_jev_shadow_runtime.py -q
+28 passed in 1.05s
+
+python3 -m compileall -q plugins/memory/hindsight scripts/jev_hindsight_shadow_report.py
+exit 0
+
+git diff --check
+exit 0
+```
+
+Only `scripts/jev_hindsight_shadow_report.py`, `tests/plugins/memory/test_hindsight_jev_shadow.py`, and this report were changed for this closure.
