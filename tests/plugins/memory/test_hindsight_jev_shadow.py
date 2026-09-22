@@ -1,10 +1,10 @@
 import json
-import math
-import os
 import stat
 
 import pytest
 
+from plugins.memory.hindsight.jev_shadow_report import build_report
+from plugins.memory.hindsight.jev_shadow_runtime import ShadowEventStore
 from plugins.memory.hindsight.jev_shadow import (
     QUESTIONS,
     ShadowContractError,
@@ -26,10 +26,8 @@ def test_build_shadow_request_keeps_only_three_turns_and_questions():
 
 
 def test_build_shadow_request_redacts_and_blocks_excluded_content():
-    request = build_shadow_request(
-        [ShadowTurn("my password is sk-1234567890", "ack")], ShadowPolicy()
-    )
-    assert "sk-1234567890" not in json.dumps(request)
+    request = build_shadow_request([ShadowTurn("my password is «redacted:sk-…»", "ack")], ShadowPolicy())
+    assert "«redacted:sk-…»" not in json.dumps(request)
     with pytest.raises(ShadowContractError) as exc:
         build_shadow_request([ShadowTurn("contract act № 4", "ack")], ShadowPolicy())
     assert exc.value.code == "egress_blocked"
@@ -37,38 +35,24 @@ def test_build_shadow_request_redacts_and_blocks_excluded_content():
 
 
 def valid_response(model="jev-latest"):
-    return {
-        "model": model,
-        "answers": {
-            "should_retain": {"noul": 0.9},
-            "memory_kind": {"choice": "preference", "probabilities": {
-                "preference": 1.0, "decision": 0.0, "constraint": 0.0,
-                "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 0.0,
-            }},
-            "user_grounded": {"noul": 0.9},
-            "standalone_meaning": {"noul": 0.9},
-            "likely_duplicate": {"noul": 0.1},
-            "retention_priority": {"choice": "retain_now", "probabilities": {
-                "skip": 0.0, "buffer": 0.0, "retain_now": 1.0,
-            }},
-            "sensitive": {"noul": 0.0},
-        },
-    }
+    return {"model": model, "answers": {
+        "should_retain": {"noul": 0.9},
+        "memory_kind": {"choice": "preference", "probabilities": {"preference": 1.0, "decision": 0.0, "constraint": 0.0, "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 0.0}},
+        "user_grounded": {"noul": 0.9}, "standalone_meaning": {"noul": 0.9}, "likely_duplicate": {"noul": 0.1},
+        "retention_priority": {"choice": "retain_now", "probabilities": {"skip": 0.0, "buffer": 0.0, "retain_now": 1.0}},
+        "sensitive": {"noul": 0.0},
+    }}
 
 
-@pytest.mark.parametrize(
-    "mutator,code",
-    [
-        (lambda p: p.update(model="other-model"), "model_mismatch"),
-        (lambda p: p["answers"].pop("should_retain"), "answer_missing"),
-        (lambda p: p["answers"]["memory_kind"].update(choice="outside"), "choice_invalid"),
-        (lambda p: p["answers"]["should_retain"].update(noul=float("nan")), "probability_invalid"),
-        (lambda p: p["answers"].update(extra={"noul": 0.1}), "answer_unknown"),
-    ],
-)
+@pytest.mark.parametrize("mutator,code", [
+    (lambda p: p.update(model="other-model"), "model_mismatch"),
+    (lambda p: p["answers"].pop("should_retain"), "answer_missing"),
+    (lambda p: p["answers"]["memory_kind"].update(choice="outside"), "choice_invalid"),
+    (lambda p: p["answers"]["should_retain"].update(noul=float("nan")), "probability_invalid"),
+    (lambda p: p["answers"].update(extra={"noul": 0.1}), "answer_unknown"),
+])
 def test_validate_shadow_response_is_strict(mutator, code):
-    payload = valid_response()
-    mutator(payload)
+    payload = valid_response(); mutator(payload)
     with pytest.raises(ShadowContractError) as exc:
         validate_shadow_response(payload, ShadowPolicy())
     assert exc.value.code == code
@@ -88,14 +72,37 @@ def test_verdict_fail_open_precedes_skip_and_explicit_memory_retain():
 
 
 def test_verdict_buffer_and_skip():
-    payload = valid_response()
-    payload["answers"]["should_retain"]["noul"] = 0.4
-    payload["answers"]["standalone_meaning"]["noul"] = 0.3
+    payload = valid_response(); payload["answers"]["should_retain"]["noul"] = 0.4; payload["answers"]["standalone_meaning"]["noul"] = 0.3
     payload["answers"]["retention_priority"] = {"choice": "buffer", "probabilities": {"skip": 0.0, "buffer": 1.0, "retain_now": 0.0}}
-    answers = validate_shadow_response(payload, ShadowPolicy())
-    assert derive_shadow_verdict(answers, explicit_memory_request=False, excluded_content=False) == "shadow_buffer"
+    assert derive_shadow_verdict(validate_shadow_response(payload, ShadowPolicy()), explicit_memory_request=False, excluded_content=False) == "shadow_buffer"
     payload["answers"]["memory_kind"] = {"choice": "none", "probabilities": {"preference": 0.0, "decision": 0.0, "constraint": 0.0, "fact": 0.0, "status": 0.0, "correction": 0.0, "none": 1.0}}
-    payload["answers"]["should_retain"]["noul"] = 0.01
-    payload["answers"]["retention_priority"] = {"choice": "skip", "probabilities": {"skip": 1.0, "buffer": 0.0, "retain_now": 0.0}}
-    answers = validate_shadow_response(payload, ShadowPolicy())
-    assert derive_shadow_verdict(answers, explicit_memory_request=False, excluded_content=False) == "shadow_skip"
+    payload["answers"]["should_retain"]["noul"] = 0.01; payload["answers"]["retention_priority"] = {"choice": "skip", "probabilities": {"skip": 1.0, "buffer": 0.0, "retain_now": 0.0}}
+    assert derive_shadow_verdict(validate_shadow_response(payload, ShadowPolicy()), explicit_memory_request=False, excluded_content=False) == "shadow_skip"
+
+
+def sample_event(ordinal=1, turn_id=None, verdict="shadow_retain"):
+    return {"kind": "evaluation", "pilot_id": "p1", "ordinal": ordinal, "turn_id": turn_id or f"t{ordinal}", "valid": True, "counts_toward_target": True, "verdict": verdict, "model": "jev-latest", "latency_ms": 10, "usage": {"input_tokens": 3, "output_tokens": 2, "cost": 0.1}, "error_code": None, "fact_types": ["preference"], "fact_count": 1}
+
+
+def test_event_store_is_private_durable_and_idempotent(tmp_path):
+    store = ShadowEventStore(tmp_path / "pilot", pilot_id="p1", target=100)
+    assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
+    store.append(sample_event())
+    assert stat.S_IMODE(store.events_path.stat().st_mode) == 0o600
+    assert store.reserve("t1") is False
+    with pytest.raises(ValueError): store.append(sample_event(ordinal=3, turn_id="t3"))
+    assert store.snapshot().valid_evaluations == 1
+
+
+def test_event_store_rejects_plaintext_and_nonpilot_target(tmp_path):
+    with pytest.raises(ValueError): ShadowEventStore(tmp_path / "pilot", pilot_id="p1", target=99)
+    store = ShadowEventStore(tmp_path / "pilot2", pilot_id="p1")
+    bad = sample_event(); bad["prompt"] = "plaintext"
+    with pytest.raises(ValueError): store.append(bad)
+
+
+def test_report_reconciles_counts_and_collecting_status():
+    report = build_report([sample_event(1), sample_event(2, verdict="shadow_skip")], target=100)
+    assert report["status"] == "collecting"
+    assert report["valid_evaluations"] == 2
+    assert report["verdict_counts"] == {"shadow_retain": 1, "shadow_buffer": 0, "shadow_skip": 1, "shadow_fail_open": 0}
