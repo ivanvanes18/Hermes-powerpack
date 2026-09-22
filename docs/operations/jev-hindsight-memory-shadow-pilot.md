@@ -49,6 +49,11 @@ or a log. The endpoint is the existing `typesafe_endpoint` setting when
 present, otherwise `TYPESAFE_API_URL`, otherwise the code default
 `https://api.typesafe.ai`.
 
+When the configured request model is the exact alias `jev-latest`, TypeSafe may
+return a concrete official model ID such as `jev-1.13.0`; the shadow validator
+accepts only the strict `jev-<major>.<minor>.<patch>` form in that alias case.
+Other configured model IDs remain exact-match only.
+
 ### Prepared configuration diff — **NOT APPLIED**
 
 This is the exact proposed addition for the Reina Hindsight provider config.

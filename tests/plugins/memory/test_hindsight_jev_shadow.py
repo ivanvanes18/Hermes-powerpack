@@ -23,7 +23,25 @@ def test_build_shadow_request_keeps_only_three_turns_and_questions():
     assert request["model"] == "jev-latest"
     assert [row["user_text"] for row in request["state"]["turns"]] == ["u1", "u2", "u3"]
     assert set(request["questions"]) == set(QUESTIONS)
-    assert all("question" not in instruction.lower() for instruction in request["instructions"].values())
+    assert set(request) == {"model", "state", "questions"}
+    assert request["questions"] == QUESTIONS
+
+
+@pytest.mark.parametrize("model", ["jev-1.13.0", "jev-0.0.1", "jev-10.2.30"])
+def test_validate_shadow_response_accepts_official_version_for_latest_alias(model):
+    assert validate_shadow_response(valid_response(model), ShadowPolicy(model="jev-latest"))
+
+
+@pytest.mark.parametrize("model", ["jev-1.13", "jev-1.13.0-beta", "jev-1.13.0+build", "jev-1.13.0.evil", "other-1.13.0"])
+def test_validate_shadow_response_rejects_non_official_version_for_latest_alias(model):
+    with pytest.raises(ShadowContractError, match="model_mismatch"):
+        validate_shadow_response(valid_response(model), ShadowPolicy(model="jev-latest"))
+
+
+def test_validate_shadow_response_preserves_exact_configured_model_ids():
+    assert validate_shadow_response(valid_response("custom-jev"), ShadowPolicy(model="custom-jev"))
+    with pytest.raises(ShadowContractError, match="model_mismatch"):
+        validate_shadow_response(valid_response("jev-1.13.0"), ShadowPolicy(model="custom-jev"))
 
 
 def test_build_shadow_request_redacts_and_blocks_excluded_content():

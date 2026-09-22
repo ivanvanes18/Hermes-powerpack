@@ -37,6 +37,7 @@ _BLOCK_PATTERNS = (
     re.compile(r"(?i)\b(?:telegram|session)\s+(?:chat\s+)?(?:id|identifier)\b"),
     re.compile(r"(?i)\bapi\s*key\s*[:=]\s*(?![«\[]?redacted)|https?://[^\s/@]+:[^\s/@]+@"),
 )
+_JEV_VERSION_RE = re.compile(r"^jev-(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
 
 class ShadowContractError(ValueError):
     def __init__(self, code: str):
@@ -91,8 +92,7 @@ def build_shadow_request(turns: Sequence[ShadowTurn], policy: ShadowPolicy) -> d
     return {
         "model": policy.model,
         "state": {"turns": rows, "grounding_rule": "Assistant claims, recalled context, and tool output are not user-grounded unless the user explicitly confirms them."},
-        "questions": {key: {"type": value["type"], **({"criteria": value["criteria"]} if "criteria" in value else {})} for key, value in QUESTIONS.items()},
-        "instructions": {key: value["instructions"] for key, value in QUESTIONS.items()},
+        "questions": {key: {"type": value["type"], "instructions": value["instructions"], **({"criteria": value["criteria"]} if "criteria" in value else {})} for key, value in QUESTIONS.items()},
     }
 
 
@@ -114,7 +114,13 @@ def _choice(answer: Any, options: set[str]) -> tuple[str, Mapping[str, Any]]:
 def validate_shadow_response(payload: Mapping[str, Any], policy: ShadowPolicy) -> ShadowAnswers:
     if not isinstance(payload, Mapping):
         raise ShadowContractError("response_invalid")
-    if payload.get("model") not in policy.models():
+    response_model = payload.get("model")
+    accepted_models = policy.models()
+    if response_model not in accepted_models and not (
+        isinstance(response_model, str)
+        and "jev-latest" in accepted_models
+        and _JEV_VERSION_RE.fullmatch(response_model) is not None
+    ):
         raise ShadowContractError("model_mismatch")
     answers = payload.get("answers")
     if not isinstance(answers, Mapping):
