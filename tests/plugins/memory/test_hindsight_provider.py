@@ -1023,6 +1023,34 @@ class TestSyncTurn:
         assert shadow.outcomes[1][0].startswith("reina-2-")
         assert shadow.outcomes[1][1].error_code == "retain_error"
 
+    def test_malformed_retain_metadata_still_records_one_succeeded_outcome(self, provider):
+        class Shadow:
+            def __init__(self):
+                self.outcomes = []
+
+            def record_retain_outcome(self, turn_id, outcome):
+                self.outcomes.append((turn_id, outcome))
+
+        shadow = Shadow()
+        provider._jev_shadow_runtime = shadow
+        # A successful retain with malformed operation metadata must not make
+        # the writer job fail after Hindsight accepted the write.
+        provider._client.aretain_batch.return_value = SimpleNamespace(
+            operation_id=None, operation_ids=3
+        )
+
+        provider.sync_turn("hello", "world")
+        provider._retain_queue.join()
+
+        assert provider._client.aretain_batch.await_count == 1
+        assert len(shadow.outcomes) == 1
+        _, outcome = shadow.outcomes[0]
+        assert outcome.status == "succeeded"
+        assert outcome.operation_ids_count == 0
+        assert outcome.error_code is None
+        assert provider._writer_thread is not None
+        assert provider._writer_thread.is_alive()
+
     def test_jev_shadow_success_preserves_exact_retain_payload(self, provider):
         baseline = _make_mock_client()
         provider._client = baseline

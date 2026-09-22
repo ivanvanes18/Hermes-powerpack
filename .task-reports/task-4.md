@@ -2,27 +2,27 @@
 
 Status: implemented and verified.
 
-Changed only the approved Task 4 files:
+Changed only the requested Task 4 implementation/test paths plus this private report:
 - `plugins/memory/hindsight/__init__.py`
 - `tests/plugins/memory/test_hindsight_provider.py`
-- `tests/plugins/memory/test_hindsight_config_schema.py`
+- `.task-reports/task-4.md`
 
 Implementation:
-- Added disabled-by-default Jev shadow configuration defaults.
-- Initializes Jev only when enabled, identity is default/Reina, `TYPESAFE_API_KEY` is available, the private event root is accepted, and fewer than 100 valid evaluations exist.
-- Maintains a salted opaque turn ID and bounded three-turn shadow window.
-- Enqueues shadow work in a broad nonfatal boundary before the unchanged Hindsight retain cadence/path.
-- Added terminal-only retain correlation: Hindsight writes exactly one Jev retain outcome per dispatched turn, from `_do_retain`, with `succeeded` or `failed` status.
-- Shadow enqueue and retain-outcome recording remain nonfatal; Hindsight retain dispatch and `aretain_batch` behavior are unchanged.
-- Added a causal provider regression covering succeeded metadata, failed metadata, absence of `queued`, unchanged `aretain_batch` calls, and the existing shadow-error nonfatal path.
-- Reset clears only in-memory shadow window and salt; shutdown drains Jev with a bounded timeout before client close.
-- Added causal tests for shadow false/exception and success paths, plus configuration defaults.
+- After `aretain_batch` returns successfully, operation tracking and operation-id counting are auxiliary, nonfatal steps.
+- Malformed operation metadata is logged at debug level and uses `operation_ids_count=0`.
+- The accepted retain still records exactly one terminal `succeeded` Jev outcome; retain exceptions still record the existing terminal `failed` outcome and re-raise to the writer boundary.
+- Existing Hindsight retain dispatch, payload, async tracking semantics, and logging remain unchanged except that malformed auxiliary metadata cannot fail the writer job.
+
+Regression:
+- Added a causal provider test with a successful `aretain_batch` response whose `operation_ids` metadata is malformed.
+- Asserts `aretain_batch` is awaited once, exactly one `succeeded` outcome is recorded with count zero, no failure outcome is recorded, and the writer remains alive.
 
 Verification:
-- Causal RED: the new provider test failed before the fix because it observed `queued` then `succeeded` for one turn.
-- Focused provider/config plus Tasks 1–3 suites: 114 passed. The checkout `.venv` is the gateway interpreter but lacks pytest and Hindsight dependencies, so the run used `uv run --with pytest --with hindsight-client==0.6.1 --python .venv/bin/python` without changing the worktree environment.
-- `compileall` passed for Hindsight and the changed tests.
-- `git diff --check` passed.
+- Causal RED: the new test failed before the fix because `_track_retain_ops` raised `TypeError` and no Jev outcome was recorded.
+- GREEN/final provider, config, and Tasks 1–3 suites: `115 passed in 5.72s`.
+- `python3 -m compileall -q plugins/memory/hindsight tests/plugins/memory/test_hindsight_provider.py`: passed.
+- `git diff --check`: passed.
 
 Concerns:
-- No live config or restart was performed. The accepted Tasks 1–3 runtime/report modules were not modified.
+- No live config or restart was performed.
+- The checkout `.venv` lacks pytest and Hindsight dependencies; verification used an ephemeral `uv run` environment without changing the worktree environment.
