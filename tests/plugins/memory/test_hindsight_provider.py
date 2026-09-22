@@ -119,6 +119,40 @@ def _provider_for_mode(tmp_path, monkeypatch, mode: str):
     return provider
 
 
+def test_jev_shadow_uses_official_typesafe_default_and_preserves_overrides(tmp_path, monkeypatch):
+    """Provider wiring must use the official host unless explicitly overridden."""
+    import plugins.memory.hindsight.jev_shadow_runtime as runtime_module
+
+    transports = []
+
+    class SpyTransport:
+        def __init__(self, endpoint, api_key, timeout):
+            transports.append((endpoint, api_key, timeout))
+
+    class SpyRuntime:
+        def __init__(self, config, store, transport):
+            self.transport = transport
+
+    monkeypatch.setattr(runtime_module, "TypeSafeTransport", SpyTransport)
+    monkeypatch.setattr(runtime_module, "JevShadowRuntime", SpyRuntime)
+    monkeypatch.setattr("plugins.memory.hindsight.get_secret", lambda name, default="": "test-key")
+    monkeypatch.delenv("TYPESAFE_API_URL", raising=False)
+
+    provider = HindsightMemoryProvider()
+    provider._config = {"jev_shadow_enabled": True, "jev_shadow_root": str(tmp_path)}
+    provider._agent_identity = "reina"
+    provider._initialize_jev_shadow(str(tmp_path))
+    assert transports[-1][0] == "https://api.typesafe.ai"
+
+    monkeypatch.setenv("TYPESAFE_API_URL", "https://env-override.example")
+    provider._initialize_jev_shadow(str(tmp_path))
+    assert transports[-1][0] == "https://env-override.example"
+
+    provider._config["typesafe_endpoint"] = "https://override.example"
+    provider._initialize_jev_shadow(str(tmp_path))
+    assert transports[-1][0] == "https://override.example"
+
+
 def _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, mode: str):
     """Cloud/local-external clients must ensure lazy deps before importing."""
     import builtins

@@ -47,7 +47,7 @@ The TypeSafe credential is read from the existing secret store entry
 `TYPESAFE_API_KEY`; never put it in `config.json`, a command argument, a report,
 or a log. The endpoint is the existing `typesafe_endpoint` setting when
 present, otherwise `TYPESAFE_API_URL`, otherwise the code default
-`https://api.typesafe.dev`.
+`https://api.typesafe.ai`.
 
 ### Prepared configuration diff — **NOT APPLIED**
 
