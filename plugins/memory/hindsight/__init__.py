@@ -1050,11 +1050,20 @@ class HindsightMemoryProvider(MemoryProvider):
                 raise
             # Async retains are only *accepted* here; track the op id(s) so the
             # next-turn prefetch can wait for true server-side completion.
+            operation_ids_count = 0
             if retain_async and track_ops:
-                self._track_retain_ops(resp, bank_id)
+                try:
+                    self._track_retain_ops(resp, bank_id)
+                except Exception:
+                    logger.debug("Hindsight retain operation tracking failed (non-fatal)", exc_info=True)
+                try:
+                    ids = getattr(resp, "operation_ids", None)
+                    operation_ids_count = len(ids) if ids else (1 if getattr(resp, "operation_id", None) else 0)
+                except Exception:
+                    logger.debug("Hindsight retain operation counting failed (non-fatal)", exc_info=True)
             if shadow_turn_id:
                 self._record_jev_retain_outcome(shadow_turn_id, "succeeded", started,
-                                                operation_ids_count=(1 if retain_async and getattr(resp, "operation_id", None) else 0))
+                                                operation_ids_count=operation_ids_count)
             logger.debug("Hindsight %s succeeded", label)
 
         return _job
