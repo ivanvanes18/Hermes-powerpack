@@ -277,8 +277,12 @@ class ShadowEventStore:
             events = self._events_locked()
             if any(event.get("turn_id") == turn_id for event in events): return False
             valid = sum(1 for event in events if event.get("kind") == "evaluation" and event.get("valid") is True and event.get("counts_toward_target") is True)
-            if valid >= self.target: return False
-            data = {"kind": "reservation", "pilot_id": self.pilot_id, "turn_id": turn_id, "counts_toward_target": False}
+            active = sum(1 for event in events
+                         if event.get("kind") == "reservation"
+                         and not any(terminal.get("kind") == "evaluation" and terminal.get("turn_id") == event.get("turn_id") for terminal in events))
+            if valid + active >= self.target: return False
+            data = {"kind": "reservation", "pilot_id": self.pilot_id, "turn_id": turn_id,
+                    "owner_pid": os.getpid(), "counts_toward_target": False}
             self._validate_event(data, events)
             line = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
             fd = self._open_relative("events.jsonl", os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
@@ -286,6 +290,50 @@ class ShadowEventStore:
             finally: os.close(fd)
             self._write_state_locked()
             return True
+
+    def reconcile_stale_reservations(self) -> int:
+        """Close claims whose owning process is no longer alive.
+
+        A reservation is a durable claim, not permission to retry after a
+        restart. Only a dead owner can be reconciled; live owners retain the
+        claim so a second runtime cannot cause an extra provider call.
+        """
+        reconciled = 0
+        with self._exclusive():
+            events = self._events_locked()
+            for reservation in events:
+                if reservation.get("kind") != "reservation":
+                    continue
+                if any(event.get("kind") == "evaluation" and event.get("turn_id") == reservation.get("turn_id") for event in events):
+                    continue
+                owner_pid = reservation.get("owner_pid")
+                try:
+                    if not isinstance(owner_pid, int) or owner_pid <= 0:
+                        owner_alive = False
+                    else:
+                        os.kill(owner_pid, 0)
+                        owner_alive = True
+                except (ProcessLookupError, PermissionError, TypeError, ValueError, OSError):
+                    owner_alive = False
+                if owner_alive:
+                    continue
+                terminal = {"kind": "evaluation", "pilot_id": self.pilot_id,
+                            "turn_id": reservation["turn_id"], "valid": False,
+                            "counts_toward_target": False, "verdict": "shadow_fail_open",
+                            "model": None, "policy": {}, "latency_ms": 0, "usage": {},
+                            "error_code": "stale_reservation", "fact_count": 0, "fact_types": []}
+                self._validate_event(terminal, events)
+                line = json.dumps(terminal, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+                fd = self._open_relative("events.jsonl", os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+                try:
+                    os.write(fd, line); os.fsync(fd)
+                finally:
+                    os.close(fd)
+                events.append(terminal)
+                reconciled += 1
+            if reconciled:
+                self._write_state_locked()
+        return reconciled
 
     def snapshot(self) -> PilotSnapshot:
         with self._exclusive():
@@ -356,6 +404,12 @@ class JevShadowRuntime:
         self._queue = queue.Queue(maxsize=config.max_queue); self._stop = threading.Event(); self._thread = None
         self._disabled = False; self._persistence_error: str | None = None
         self._admission_lock = threading.Lock(); self._admitted: set[str] = set()
+        try:
+            self.store.reconcile_stale_reservations()
+        except AttributeError:
+            pass
+        except (ValueError, OSError) as exc:
+            self._disable_persistence(exc)
 
     def _disable_persistence(self, error: BaseException) -> None:
         self._disabled = True
@@ -388,23 +442,34 @@ class JevShadowRuntime:
                 existing = self.store.events() if hasattr(self.store, "events") else []
                 if any(event.get("turn_id") == turn_id for event in existing):
                     return False
-                snapshot = self.store.snapshot() if hasattr(self.store, "snapshot") else None
-                if snapshot is not None and snapshot.valid_evaluations + len(self._admitted) >= self.store.target:
-                    self.store.append({"kind": "evaluation", "pilot_id": self.store.pilot_id,
-                                       "turn_id": turn_id, "valid": False,
-                                       "counts_toward_target": False,
-                                       "verdict": "shadow_fail_open", "model": None,
-                                       "policy": self._policy_dict(), "latency_ms": 0,
-                                       "usage": {}, "error_code": "target_reached",
-                                       "fact_count": 0, "fact_types": []})
+                if not self.store.reserve(turn_id):
+                    try:
+                        self.store.append({"kind": "evaluation", "pilot_id": self.store.pilot_id,
+                                           "turn_id": turn_id, "valid": False,
+                                           "counts_toward_target": False,
+                                           "verdict": "shadow_fail_open", "model": None,
+                                           "policy": self._policy_dict(), "latency_ms": 0,
+                                           "usage": {}, "error_code": "target_reached",
+                                           "fact_count": 0, "fact_types": []})
+                    except ValueError:
+                        pass
                     return False
-                if not self.store.reserve(turn_id): return False
             except (ValueError, OSError) as exc:
                 self._disable_persistence(exc); return False
             self._admitted.add(turn_id)
         try: self._queue.put_nowait((turn_id, list(turns), explicit_memory_request))
         except queue.Full:
             with self._admission_lock: self._admitted.discard(turn_id)
+            try:
+                self.store.append({"kind": "evaluation", "pilot_id": self.store.pilot_id,
+                                   "turn_id": turn_id, "valid": False,
+                                   "counts_toward_target": False,
+                                   "verdict": "shadow_fail_open", "model": None,
+                                   "policy": self._policy_dict(), "latency_ms": 0,
+                                   "usage": {}, "error_code": "queue_full",
+                                   "fact_count": 0, "fact_types": []})
+            except (ValueError, OSError) as exc:
+                self._disable_persistence(exc)
             return False
         self._ensure(); return True
 

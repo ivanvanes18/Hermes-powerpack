@@ -37,6 +37,27 @@ class CountingTransport:
         return deepcopy(self.payload)
 
 
+class ProcessCountingTransport:
+    def __init__(self, counter):
+        self.counter = counter
+
+    def evaluate(self, request):
+        with self.counter.get_lock():
+            self.counter.value += 1
+        return response_payload()
+
+
+def _run_process_runtime(root, counter, offset):
+    runtime = JevShadowRuntime(
+        ShadowRuntimeConfig(pilot_id="reina", max_queue=128),
+        ShadowEventStore(root, "reina"),
+        ProcessCountingTransport(counter),
+    )
+    for index in range(60):
+        runtime.enqueue(f"process-{offset + index}", [ShadowTurn("u", "a")], explicit_memory_request=False)
+    runtime.shutdown(5)
+
+
 class FakeRetainResponse:
     operation_ids = ("op-1",)
 
@@ -133,26 +154,29 @@ def test_malformed_provider_answers_are_fail_open_and_retain_still_runs(tmp_path
     assert "shadow_skip" not in json.dumps(event)
 
 
-def test_duplicate_json_response_is_rejected_without_semantic_skip(tmp_path):
-    class DuplicateTransport:
-        def __init__(self):
-            self.calls = 0
+def test_duplicate_json_response_is_rejected_without_semantic_skip(tmp_path, monkeypatch):
+    class Reply:
+        def __enter__(self):
+            return self
 
-        def evaluate(self, request):
-            self.calls += 1
-            raise ShadowContractError("duplicate_key")
+        def __exit__(self, *args):
+            return None
 
-    transport = DuplicateTransport()
+        def read(self):
+            return b'{"model":"jev-latest","model":"jev-latest","answers":{}}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: Reply())
+    transport = TypeSafeTransport("http://typesafe.invalid", "key", 1.0)
     runtime = _runtime(tmp_path / "duplicate", transport)
     retain_calls = []
     provider = _provider(runtime, retain_calls)
     provider.sync_turn("Я утвердил решение.", "Понял.")
     _wait_and_shutdown(provider)
-    assert transport.calls == 1
     assert retain_calls == [True]
     event = next(e for e in runtime.store.events() if e["kind"] == "evaluation")
     assert event["verdict"] == "shadow_fail_open"
     assert event["counts_toward_target"] is False
+    assert event["error_code"] == "duplicate_key"
 
 
 def test_html_provider_error_is_fail_open_and_retains(tmp_path, monkeypatch):
@@ -198,6 +222,28 @@ def test_exact_100_evaluations_101_retains_stop_and_reconcile(tmp_path):
     assert report["status"] == "pending_analysis"
     assert report["retain_outcomes"] == {"failed": 0, "missing": 0, "queued": 0, "succeeded": 101}
     assert all(f"PLAINTEXT-TURN-MARKER-{i}" not in json.dumps(events) for i in range(101))
+
+
+def test_multi_process_runtime_admission_is_globally_bounded(tmp_path):
+    import multiprocessing
+
+    root = tmp_path / "multi-process"
+    counter = multiprocessing.Value("i", 0)
+    processes = [
+        multiprocessing.Process(target=_run_process_runtime, args=(root, counter, offset))
+        for offset in (0, 60)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+
+    store = ShadowEventStore(root, "reina")
+    assert counter.value == 100
+    assert store.snapshot().valid_evaluations == 100
+    assert store.snapshot().terminal_state == "pending_analysis"
+    assert len([event for event in store.events() if event["kind"] == "reservation"]) == 100
 
 
 def test_restart_resume_60_plus_40_duplicate_is_idempotent(tmp_path):

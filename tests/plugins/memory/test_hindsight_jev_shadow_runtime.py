@@ -31,6 +31,11 @@ class FakeTransport:
         return self.payload
 
 
+def _leave_reservation(root):
+    from plugins.memory.hindsight.jev_shadow_runtime import ShadowEventStore
+    ShadowEventStore(root, "p1").reserve("crashed-turn")
+
+
 def test_transport_uses_systemone_and_bearer(monkeypatch):
     seen = {}
     class Reply:
@@ -80,6 +85,25 @@ def test_runtime_stops_at_one_hundred_and_records_provider_failure(tmp_path):
     runtime.shutdown(3)
     assert runtime.store.snapshot().valid_evaluations == 100
     assert runtime.enqueue("v100", [ShadowTurn("u", "a")], explicit_memory_request=False) is False
+
+
+def test_runtime_reconciles_dead_process_claim_without_provider_call(tmp_path):
+    import multiprocessing
+    from plugins.memory.hindsight.jev_shadow_runtime import ShadowEventStore
+
+    root = tmp_path / "stale"
+    process = multiprocessing.Process(target=_leave_reservation, args=(root,))
+    process.start()
+    process.join(5)
+    assert process.exitcode == 0
+
+    transport = FakeTransport(payload=response_payload())
+    runtime = JevShadowRuntime(ShadowRuntimeConfig(pilot_id="p1"), ShadowEventStore(root, "p1"), transport)
+    assert transport.calls == 0
+    assert runtime.store.snapshot().valid_evaluations == 0
+    stale = next(event for event in runtime.store.events() if event.get("turn_id") == "crashed-turn" and event.get("kind") == "evaluation")
+    assert stale["error_code"] == "stale_reservation"
+    runtime.shutdown()
 
 
 def test_store_allows_evaluation_and_retain_outcome_for_same_turn(tmp_path):
