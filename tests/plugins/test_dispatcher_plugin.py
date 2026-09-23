@@ -129,13 +129,26 @@ def test_close_persists_the_claimed_task_status():
     assert ctx.state.data["tasks"][0]["status"] == "ЗАВЕРШЕНО"
 
 
-@pytest.mark.parametrize("status", [
-    "АКТИВНО", "ПРЕРВАНО", "ПАУЗА", "БЛОКЕР", "ЗАВЕРШЕНО", "ЗАМЕНЕНО", "НЕИЗВЕСТНО",
-])
-def test_dispatcher_accepts_native_status_vocabulary(status):
+@pytest.mark.parametrize("status", ["АКТИВНО", "ПРЕРВАНО", "ПАУЗА", "БЛОКЕР", "НЕИЗВЕСТНО"])
+def test_dispatcher_renders_open_native_statuses(status):
     ctx = Ctx([task("one", "card-one", status=status)])
     register(ctx)
     cards = ctx.kwargs["gateway_handler"](
         PluginCommandContext(None, None, "dispatcher-session", "42", "7", "9")
     )
     assert len(cards) == 1
+
+
+@pytest.mark.parametrize("status", ["ЗАВЕРШЕНО", "ЗАМЕНЕНО"])
+def test_dispatcher_hides_terminal_tasks_from_interactive_cards(status):
+    ctx = Ctx([
+        task("open", "card-open", status="ПРЕРВАНО"),
+        task("terminal", "card-terminal", status=status),
+    ])
+    register(ctx)
+
+    cards = ctx.kwargs["gateway_handler"](
+        PluginCommandContext(None, None, "dispatcher-session", "42", "7", "9")
+    )
+
+    assert [card.card_id for card in cards] == ["card-open"]

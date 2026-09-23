@@ -116,6 +116,7 @@ def register(ctx) -> None:
             tasks = _tasks(ctx)
             if not tasks:
                 return refresh_result
+        tasks = [task for task in tasks if task["status"] not in {"ЗАВЕРШЕНО", "ЗАМЕНЕНО"}]
         cards = []
         for task in tasks:
             def action(action_name, card_context, task_id=task["id"]):
