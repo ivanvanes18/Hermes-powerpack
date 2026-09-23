@@ -1,12 +1,26 @@
 ---
 name: public-endpoint-ops
-description: "Expose, verify, diagnose, or remove public HTTP endpoints safely: DNS, nginx/reverse proxy, TLS, ports, health checks, and rollback notes."
+description: Operate public HTTP endpoints safely.
 version: 1.0.0
 license: MIT
 metadata:
   hermes:
-    tags: [endpoint, nginx, tls, dns, deploy, devops, workshop]
-    related_skills: [server-doctor, porkbun-api-dns]
+    tags:
+    - endpoint
+    - nginx
+    - tls
+    - dns
+    - deploy
+    - devops
+    - workshop
+    related_skills:
+    - server-doctor
+    - porkbun-api-dns
+author: Hermes Agent
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # Public Endpoint Ops

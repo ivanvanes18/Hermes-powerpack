@@ -197,7 +197,7 @@ def _write_health_reason(state_db_path: Path, *, should_fix: bool):
     store is probed in place. Returns the failure reason, or None when healthy or skipped."""
     from hermes_state_repair import _db_opens_cleanly, _live_writer_holds_db
     if not _live_writer_holds_db(state_db_path):
-        return _db_opens_cleanly(state_db_path)
+        return _db_opens_cleanly(state_db_path, full_integrity_check=False)
     if not should_fix and state_db_path.stat().st_size > _WRITE_PROBE_SNAPSHOT_MAX_BYTES:
         check_info("state.db write-health probe skipped: store is held by a live writer and larger than 1 GB "
                    "(run 'hermes doctor --fix' to probe it)")
@@ -215,7 +215,7 @@ def _write_health_reason(state_db_path: Path, *, should_fix: bool):
                 dest.close()
         finally:
             src.close()
-        return _db_opens_cleanly(snapshot)
+        return _db_opens_cleanly(snapshot, full_integrity_check=False)
 
 
 # Corruption class -> (ok label, not-fixed label, failed issue, fix hint). ``{count}`` = recovered sessions.
@@ -292,12 +292,16 @@ def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: st
     """Session count + FTS write-health probe; malformed-schema path when even COUNT(*) fails."""
     try:
         check_ok(f"{_DHH}/state.db exists ({_session_count(state_db_path)} sessions)")
+        # ``--fix`` may perform surgery, so classify canonical b-tree damage
+        # before the bounded FTS probe. The ordinary read-only doctor keeps the
+        # bounded path and never pays for a whole-file integrity scan.
+        if should_fix and _report_structural_damage(
+            f, should_fix, state_db_path, _DHH, "structural integrity probe",
+        ):
+            return
         # COUNT(*) succeeds even when the FTS index is corrupt and every write fails through the triggers;
         # use the stable bounded write-health probe, then retain the candidate's repair path.
         _write_reason = _write_health_reason(state_db_path, should_fix=should_fix)
-        if _write_reason is not None:
-            check_warn(f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)", f"({_write_reason})")
-            _repair_state_db(f, should_fix, state_db_path, "fts")
     except Exception as e:
         return _classify_unreadable_state_db(f, should_fix, state_db_path, _DHH, e)
     if _write_reason is not None:

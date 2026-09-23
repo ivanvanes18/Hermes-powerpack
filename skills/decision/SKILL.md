@@ -1,10 +1,23 @@
 ---
 name: decision
-description: "Senior decision-making framework for important strategic, operational, product, technical, hiring, financial, or life choices. Use when the user invokes /decision or asks to choose between options, evaluate a tradeoff, decide whether to do something, or structure a high-stakes choice."
+description: Structure high-stakes decisions and tradeoffs.
 metadata:
   hermes:
-    tags: [decision-making, strategy, tradeoffs, planning]
-    related_skills: [reasoning-personas, rp]
+    tags:
+    - decision-making
+    - strategy
+    - tradeoffs
+    - planning
+    related_skills:
+    - reasoning-personas
+    - rp
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # /decision — Decision Framework

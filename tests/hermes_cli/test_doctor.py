@@ -91,6 +91,7 @@ def test_doctor_selects_bounded_state_db_probe(monkeypatch, tmp_path):
         return None
 
     monkeypatch.setattr(hermes_state_repair, "_db_opens_cleanly", recording_probe)
+    monkeypatch.setattr(hermes_state_repair, "_live_writer_holds_db", lambda path: False)
     doctor_state._state_db_health(Finding(), False, db_path, str(tmp_path))
 
     assert calls == [(db_path, {"full_integrity_check": False})]

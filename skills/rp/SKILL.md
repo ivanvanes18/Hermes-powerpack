@@ -1,6 +1,17 @@
 ---
 name: rp
-description: "Shortcut alias for reasoning-personas. Use when the user types /rp or asks for persona-based analysis."
+description: Route persona-based analysis requests.
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms:
+- linux
+- macos
+- windows
+metadata:
+  hermes:
+    tags:
+    - rp
 ---
 
 # /rp — Reasoning Personas Shortcut

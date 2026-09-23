@@ -1,12 +1,24 @@
 ---
 name: porkbun-api-dns
-description: "Manage DNS records through Porkbun API: read records, add/edit/delete A/AAAA/CNAME/TXT, and verify authoritative/public resolver propagation."
+description: Manage Porkbun DNS records safely.
 version: 1.0.0
 license: MIT
 metadata:
   hermes:
-    tags: [dns, porkbun, domains, infrastructure, workshop]
-    related_skills: [server-doctor, public-endpoint-ops]
+    tags:
+    - dns
+    - porkbun
+    - domains
+    - infrastructure
+    - workshop
+    related_skills:
+    - server-doctor
+    - public-endpoint-ops
+author: Hermes Agent
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # Porkbun API DNS

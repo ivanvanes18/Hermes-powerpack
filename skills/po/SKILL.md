@@ -1,12 +1,23 @@
 ---
 name: po
-description: "Prompt Optimizer. Turns a rough request into three stronger prompts without executing the task. Use for /po, prompt optimization, prompt variants, or when a user wants a better prompt for another model/agent."
+description: Optimize rough requests into stronger prompts.
 version: 1.0.0
 license: MIT
 metadata:
   hermes:
-    tags: [prompting, prompt-optimizer, codex, workshop]
-    related_skills: [codex, hermes-agent]
+    tags:
+    - prompting
+    - prompt-optimizer
+    - codex
+    - workshop
+    related_skills:
+    - codex
+    - hermes-agent
+author: Hermes Agent
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # /po — Prompt Optimizer

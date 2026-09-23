@@ -1,6 +1,17 @@
 ---
 name: reasoning-personas
-description: "Activate high-agency thinking modes for brainstorming, decisions, plan review, architecture, and tradeoffs."
+description: Apply focused reasoning personas to hard problems.
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms:
+- linux
+- macos
+- windows
+metadata:
+  hermes:
+    tags:
+    - reasoning-personas
 ---
 
 # Reasoning Personas

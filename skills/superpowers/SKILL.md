@@ -1,15 +1,23 @@
 ---
 name: superpowers
-description: "Rigorous execution mode for hard work: clarify the objective, choose the right specialist workflow, make a plan, use tools, test, review, and ship. Use when the user invokes /superpowers or asks for a stronger, more systematic approach to coding, debugging, research, design, or implementation."
+description: Apply a rigorous end-to-end workflow.
 metadata:
   hermes:
-    tags: [execution, planning, tdd, debugging, code-review, research]
-    related_skills:
-      - software-development/writing-plans
-      - software-development/test-driven-development
-      - software-development/systematic-debugging
-      - software-development/requesting-code-review
-      - software-development/subagent-driven-development
+    tags:
+    - execution
+    - planning
+    - tdd
+    - debugging
+    - code-review
+    - research
+    related_skills: []
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # /superpowers — Rigorous Execution Mode

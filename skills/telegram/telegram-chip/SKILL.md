@@ -1,13 +1,25 @@
 ---
 name: telegram-chip
-description: "Operate a user-owned Telegram/Telethon runtime safely: read chats, recover media, export history, and send messages only with explicit target clarity. Public-safe version for Hermes Powerpack."
+description: Operate user-owned Telegram safely.
 version: 1.0.0
 author: Hermes Powerpack
 license: MIT
 metadata:
   hermes:
-    tags: [telegram, telethon, userbot, media, export, messaging, safety]
-    related_skills: [hermes-agent]
+    tags:
+    - telegram
+    - telethon
+    - userbot
+    - media
+    - export
+    - messaging
+    - safety
+    related_skills:
+    - hermes-agent
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # telegram-chip

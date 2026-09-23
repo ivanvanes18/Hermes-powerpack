@@ -26,6 +26,7 @@ def _large_wal_db(tmp_path):
 
 def test_doctor_checkpoint_runs_only_on_the_exclusive_repair_guard(tmp_path, monkeypatch):
     db = _large_wal_db(tmp_path)
+    monkeypatch.setattr(hermes_state_repair, "_live_writer_holds_db", lambda path: False)
 
     bare_connects: list[str] = []
     real_connect = sqlite3.connect
@@ -49,8 +50,9 @@ def test_doctor_checkpoint_runs_only_on_the_exclusive_repair_guard(tmp_path, mon
     _state_db_wal(finding, True, db)
 
     assert finding.fixed == 1 and not finding.issues
-    # Every writable open went through the repair connector (probe + exclusive guard); none was a bare connect.
-    assert bare_connects and len(bare_connects) == len(guard_connects) >= 2
+    # The checkpoint itself opens exactly once through the exclusive repair
+    # connector; holder discovery is mocked above to isolate this contract.
+    assert bare_connects and len(bare_connects) == len(guard_connects) >= 1
 
 
 def test_session_count_reads_a_home_with_uri_reserved_characters(tmp_path):

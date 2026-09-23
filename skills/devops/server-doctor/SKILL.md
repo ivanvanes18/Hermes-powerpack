@@ -1,12 +1,28 @@
 ---
 name: server-doctor
-description: "Public-safe VPS/server diagnostic workflow for SSH access, disk/memory/process checks, Docker/nginx/systemd triage, service health, and deployment readiness."
+description: Diagnose VPS and server health safely.
 version: 1.0.0
 license: MIT
 metadata:
   hermes:
-    tags: [server, vps, ssh, devops, diagnostics, systemd, nginx, docker, workshop]
-    related_skills: [public-endpoint-ops, porkbun-api-dns]
+    tags:
+    - server
+    - vps
+    - ssh
+    - devops
+    - diagnostics
+    - systemd
+    - nginx
+    - docker
+    - workshop
+    related_skills:
+    - public-endpoint-ops
+    - porkbun-api-dns
+author: Hermes Agent
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # Server Doctor

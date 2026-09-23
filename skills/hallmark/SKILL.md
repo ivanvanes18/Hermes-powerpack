@@ -1,7 +1,17 @@
 ---
 name: hallmark
-description: "Anti-AI-slop design skill for greenfield pages, audits, redesigns, and design extraction from URLs or screenshots. Use when the user asks to build a new app or landing page, wants to redesign something, invokes Hallmark by name, or uses audit/redesign/study."
+description: Design and audit distinctive web experiences.
 version: 1.1.0
+author: Hermes Agent
+license: MIT
+platforms:
+- linux
+- macos
+- windows
+metadata:
+  hermes:
+    tags:
+    - hallmark
 ---
 
 # Hallmark

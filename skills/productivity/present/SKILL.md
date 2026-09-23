@@ -1,13 +1,27 @@
 ---
 name: present
-description: Generates polished HTML presentations/documents for chat using template routing (general/report/offer) and sends them as .html attachments.
+description: Generate polished HTML presentations.
 metadata:
   hermes:
-    tags: [presentation, slides, html, reports, documents]
-    related_skills: [powerpoint, google-workspace]
+    tags:
+    - presentation
+    - slides
+    - html
+    - reports
+    - documents
+    related_skills:
+    - powerpoint
+    - google-workspace
   slash:
     command: /present
     emoji: 📄
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # /present

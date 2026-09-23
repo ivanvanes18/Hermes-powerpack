@@ -990,13 +990,20 @@ def _read_referenced_script(
     which another thread opens SQLite after the check but before this function
     closes its descriptor, cancelling that connection's POSIX locks.
     """
+    if _on_cloud_path(path):
+        return None, True
+    protected = _sqlite_lock_domain(path)
+    if protected is None:
+        return None, False
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
 
     try:
-        with offline_file_access(path, what="read referenced script"):
+        with offline_file_access(protected, what="read referenced script"):
             return _read_referenced_script_unlocked(path, max_bytes=max_bytes)
     except LiveConnectionError:
-        return None, True
+        # A local SQLite owner prevents this process from reading safely, but a
+        # remote backend has independent locks and must still get a chance.
+        return None, False
     except (OSError, ValueError):
         # Invalid path values, including embedded NULs, are not scripts.
         return None, False
@@ -1020,23 +1027,7 @@ def _read_referenced_script_unlocked(
 
     See #88052.
     """
-    if _on_cloud_path(path):
-        return None, True
-    from hermes_cli import sqlite_safe_read
-
-    protected = _sqlite_lock_domain(path)
-    if protected is None:
-        return None, False
-    try:
-        with sqlite_safe_read.offline_file_access(protected, what="scan a referenced script"):
-            return _read_referenced_script_unchecked(path, max_bytes=max_bytes)
-    except sqlite_safe_read.LiveConnectionError:
-        # An open SQLite database is not a shell script, so this is not "unsafe to run". Report it
-        # as "nothing read locally" (None), exactly like an unreadable path: the refusal is about
-        # THIS process's POSIX locks, so a remote-backend read — a different machine's filesystem —
-        # is still both safe and required for scan coverage. Suppressing it with "" would silently
-        # drop the remote script from the lifecycle scan.
-        return None, False
+    return _read_referenced_script_unchecked(path, max_bytes=max_bytes)
 
 
 def _read_referenced_script_unchecked(

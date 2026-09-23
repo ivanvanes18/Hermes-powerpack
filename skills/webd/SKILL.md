@@ -1,6 +1,17 @@
 ---
 name: webd
-description: Complete web design system combining aesthetics, conversion optimization, and component libraries. Use for landing pages, SaaS sites, or any frontend project requiring design thinking + conversion focus. Includes design framework (7 aesthetic directions), conversion patterns (from Landing Pages Explained), and 17+ UI libraries. Three workflows - Component-First (quick), Design-First (distinctive), Conversion-First (marketing).
+description: Design conversion-focused web interfaces.
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms:
+- linux
+- macos
+- windows
+metadata:
+  hermes:
+    tags:
+    - webd
 ---
 
 # webd 🎨

@@ -60,7 +60,7 @@ HCP_DIR = os.path.expanduser(
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 USAGE_TIMEOUT = 8
 CACHE_MAX_AGE = 15 * 60
-CACHE_PATH = "/tmp/gptprof_usage_cache.json"
+CACHE_PATH = os.path.join(HERMES_HOME, "gptprof", "usage_cache.json")
 ACCESS_REFRESH_SKEW = int(os.getenv("GPTPROF_ACCESS_REFRESH_SKEW", str(48 * 60 * 60)))
 # Optional external OpenClaw import is a break-glass path, not the primary refresh path.
 INTEL64_OPENCLAW_SYNC = os.getenv("GPTPROF_INTEL64_OPENCLAW_SYNC", "0") == "1"

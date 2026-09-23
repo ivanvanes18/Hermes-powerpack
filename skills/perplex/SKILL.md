@@ -1,12 +1,22 @@
 ---
 name: perplex
-description: "Perplexity/Sonar-style current web research workflow. Use for current facts, source-backed answers, market/vendor/news checks, and research gates before planning."
+description: Research current topics with cited web sources.
 version: 1.0.0
 license: MIT
 metadata:
   hermes:
-    tags: [research, web-search, perplexity, sources, workshop]
-    related_skills: [par, deep]
+    tags:
+    - research
+    - web-search
+    - perplexity
+    - sources
+    - workshop
+    related_skills: []
+author: Hermes Agent
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # perplex
