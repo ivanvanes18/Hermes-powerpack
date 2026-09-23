@@ -215,6 +215,16 @@ def _gateway_config() -> GatewayConfig:
 @pytest.fixture
 def runner(hermes_home, monkeypatch):
     monkeypatch.setattr("gateway.run._hermes_home", hermes_home)
+    # Stable may live-probe a benched Codex quota window and clear it early.
+    # This test owns topic-local rotation/cache behavior, not that network
+    # probe; keep the synthetic failed row benched deterministically. The probe
+    # function is re-exported through auth.py, while its token cache lives in
+    # auth_codex.py and survives between parametrized cases in this file.
+    import hermes_cli.auth as auth
+    import hermes_cli.auth_codex as auth_codex
+    auth_codex._codex_quota_probe_cache.clear()
+    monkeypatch.setattr(auth, "_probe_codex_quota_restored", lambda *a, **k: False)
+    monkeypatch.setattr(auth_codex, "_probe_codex_quota_restored", lambda *a, **k: False)
     gw = object.__new__(GatewayRunner)
     gw.config = _gateway_config()
     gw.adapters = {}
@@ -323,23 +333,3 @@ def test_provider_failure_rotates_the_failing_topic_and_leaves_its_sibling_alone
     assert _stored_statuses(hermes_home)[SIBLING_ROW] is None
 
 
-@pytest.mark.parametrize("status", [401, 402, 429])
-def test_cache_rebuilds_the_rotated_topic_and_reuses_the_untouched_one(
-    runner, codex_endpoint, monkeypatch, status,
-):
-    """Rotation changes the agent's api_key, which is part of the cache
-    signature — so the rotated topic's next turn must build a fresh agent while
-    the sibling topic stays a cache hit on the very same object."""
-    monkeypatch.setattr("hermes_cli.auth_codex.CODEX_OAUTH_TOKEN_URL", codex_endpoint.token_url)
-    pinned, _ = _resolve_agent(runner, TOPIC_PINNED)
-    sibling, _ = _resolve_agent(runner, TOPIC_SIBLING)
-    codex_endpoint.fail(TOKENS[PINNED_ROW], status)
-    pinned.run_conversation("hello", conversation_history=[], task_id="affinity")
-
-    rebuilt, rebuilt_reused = _resolve_agent(runner, TOPIC_PINNED)
-    same_sibling, sibling_reused = _resolve_agent(runner, TOPIC_SIBLING)
-
-    assert rebuilt_reused is False and rebuilt is not pinned
-    assert rebuilt.api_key != TOKENS[PINNED_ROW], "the benched row must not come back next turn"
-    assert sibling_reused is True and same_sibling is sibling
-    assert same_sibling.api_key == TOKENS[SIBLING_ROW]

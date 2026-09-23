@@ -205,7 +205,7 @@ def _status_model_route(status_agent, persisted_route: dict, session_row: dict, 
             context_used = max(0, _int_value(getattr(ctx, "last_prompt_tokens", 0)))
             context_total = _int_value(getattr(ctx, "context_length", 0))
     routes.append((_clean_str(persisted_route.get("model")),
-                   _clean_str(persisted_route.get("billing_provider"))))
+                   _clean_str(persisted_route.get("billing_provider") or persisted_route.get("provider"))))
     row_route = (_clean_str(session_row.get("model")), _clean_str(session_row.get("billing_provider")))
     # First fully-resolved (model AND provider) route wins; the SessionDB row is used even if partial.
     model_name, provider_name = next((r for r in routes if r[0] and r[1]), row_route)
@@ -375,10 +375,10 @@ class GatewayStatusCommandsMixin:
         except (TypeError, ValueError):
             cost = 0.0
 
-        from gateway.run import _load_gateway_runtime_config
+        from gateway.run import _load_gateway_config
 
         with self._profile_scope_for_source(source):
-            cfg = _quiet_sync(_load_gateway_runtime_config, {})
+            cfg = _quiet_sync(_load_gateway_config, {})
             model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
             model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
             fallback_chain = get_fallback_chain(cfg)
@@ -474,7 +474,13 @@ class GatewayStatusCommandsMixin:
             _int_value(session_row.get(k))
             for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
         )
-        route = await _quiet(lambda: db.get_dominant_session_model_route(session_id))
+        # Stable renamed this query from "dominant" (lifetime-most-used) to
+        # "recent" (actual current route). Keep compatibility with an older
+        # AsyncSessionDB while preferring the stable coherent per-call tuple.
+        if hasattr(db, "get_recent_session_model_route"):
+            route = await _quiet(lambda: db.get_recent_session_model_route(session_id))
+        else:
+            route = await _quiet(lambda: db.get_dominant_session_model_route(session_id))
         return title, session_row, db_total_tokens, route if isinstance(route, dict) else {}
 
     @staticmethod

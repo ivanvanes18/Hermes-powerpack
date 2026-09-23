@@ -316,8 +316,8 @@ async def test_status_command_resolves_profile_scoped_runtime_settings(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_status_command_uses_dominant_persisted_model_route(tmp_path):
-    """Persisted status must not combine a model and provider from different calls."""
+async def test_status_command_uses_recent_persisted_model_route(tmp_path):
+    """Persisted status uses the most recent coherent per-call route."""
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
         session_id="sess-1",
@@ -357,7 +357,7 @@ async def test_status_command_uses_dominant_persisted_model_route(tmp_path):
 
         result = await runner._handle_message(_make_event("/status"))
 
-        assert "🧠 Model: z-ai/glm-5.2 (nvidia)" in result
+        assert "🧠 Model: upstage/solar-pro4:free (nous)" in result
         assert "🧠 Model: z-ai/glm-5.2 (nous)" not in result
     finally:
         db.close()
