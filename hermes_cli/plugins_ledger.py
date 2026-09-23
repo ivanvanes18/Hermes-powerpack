@@ -222,6 +222,10 @@ class PluginLedgerMixin:
     def unload(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
         """Unload registrations while excluding discovery/deferred loading."""
         with self._discovery_lock, _plugin_home_scope(self.home_path):
+            registry = getattr(self, "_plugin_card_registry", None)
+            if registry is not None:
+                registry.clear()
+            self._plugin_card_registry = None
             return self._unload_scoped(plugin)
 
     def _unload_scoped(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
@@ -260,6 +264,10 @@ class PluginLedgerMixin:
 
     def _reset_after_unload_all(self, registrations: List[PluginRegistration]) -> None:
         """Sweep pre-ledger global state and clear every manager-local container."""
+        registry = getattr(self, "_plugin_card_registry", None)
+        if registry is not None:
+            registry.clear()
+        self._plugin_card_registry = None
         # Handles are authoritative for global registries; names present in the manager-local sets without a
         # ledger entry (pre-ledger or manually set state) are swept here so they do not survive a force reload
         # as zombies.

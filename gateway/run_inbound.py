@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures
 import dataclasses
+import uuid
 import json
 import os
 import re
@@ -1037,7 +1038,7 @@ class GatewayInboundMixin:
             return "Quick command failed."
 
     async def _hm_dispatch_quick_and_plugin_commands(
-        self, event: "MessageEvent", source: SessionSource, command: Optional[str]
+        self, event: "MessageEvent", source: SessionSource, command: Optional[str], session_key: str = ""
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
@@ -1072,15 +1073,62 @@ class GatewayInboundMixin:
         # underscored autocomplete form matches plugin commands registered with hyphens.
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                from hermes_cli.plugins import get_plugin_command_entry, get_plugin_command_handler
+                entry = get_plugin_command_entry(command.replace("_", "-"))
+                plugin_handler = entry.get("handler") if entry else get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    result = plugin_handler(event.get_command_args().strip())
+                    gateway_handler = entry.get("gateway_handler") if entry else None
+                    manager = None
+                    adapter = None
+                    card_context = None
+                    PluginCard = None
+                    if gateway_handler is not None:
+                        from gateway.plugin_cards import PluginCommandContext, PluginCard
+                        manager = __import__("hermes_cli.plugins", fromlist=["get_plugin_manager"]).get_plugin_manager()
+                        adapter = self._delivery_adapter_for(source)
+                        card_context = PluginCommandContext(
+                            event=event, source=source, session_key=session_key,
+                            chat_id=str(getattr(source, "chat_id", "")),
+                            thread_id=getattr(source, "thread_id", None),
+                            user_id=str(getattr(source, "user_id", "")), adapter=adapter,
+                            plugin_context=entry.get("plugin_context"),
+                            request_text=(getattr(adapter, "arm_plugin_text_capture", None)),
+                        )
+                        result = gateway_handler(card_context)
+                    else:
+                        result = plugin_handler(event.get_command_args().strip())
                     if asyncio.iscoroutine(result):
                         result = await result
+                    if gateway_handler is not None:
+                        if isinstance(result, PluginCard):
+                            cards = [result]
+                        elif isinstance(result, (list, tuple)) and all(isinstance(item, PluginCard) for item in result):
+                            cards = list(result)
+                        else:
+                            return True, str(result) if result else None, command
+                        renderer = getattr(adapter, "send_plugin_card", None)
+                        if not callable(renderer):
+                            return True, "This gateway adapter does not support interactive cards.", command
+                        for card in cards:
+                            # A fresh opaque token prevents a callback from an unloaded/reloaded card
+                            # from aliasing the replacement card with the same task id.
+                            card = dataclasses.replace(card, card_id=uuid.uuid4().hex[:16])
+                            manager.plugin_card_registry.add(card)
+                            binder = getattr(adapter, "bind_plugin_card_manager", None)
+                            if callable(binder):
+                                binder(card.card_id, manager)
+                            delivery = await renderer(card_context.chat_id, card, metadata={"thread_id": card_context.thread_id})
+                            if hasattr(delivery, "success") and delivery.success is False:
+                                manager.plugin_card_registry.discard(card.card_id)
+                                popper = getattr(adapter, "pop_plugin_card_manager", None)
+                                if callable(popper):
+                                    popper(card.card_id)
+                                return True, f"Interactive card delivery failed: {getattr(delivery, 'error', 'unknown error')}", command
+                        return True, None, command
                     return True, str(result) if result else None, command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
+                return True, "Plugin command failed safely; no action was taken.", command
         return False, None, command
 
     def _hm_bundle_slash_rewrite(
@@ -1229,7 +1277,7 @@ class GatewayInboundMixin:
         if not _handled:
             _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
         if not _handled:
-            _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command)
+            _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command, _quick_key)
         if not _handled:
             # Skill-slash resolution is disk-bound (cold skill scan, skill file loads, the
             # unavailable-skill rglob over every skills dir) and uncached on a first hit; on a

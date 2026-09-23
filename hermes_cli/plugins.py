@@ -662,7 +662,7 @@ class PluginContext:
     @_serialized_replacement
     def register_command(
         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
-        argument_mode: str | None = None,
+        argument_mode: str | None = None, gateway_handler: Callable | None = None,
     ) -> Optional[PluginRegistration]:
         """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
         (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
@@ -679,8 +679,8 @@ class PluginContext:
                 return
         hint = (args_hint or "").strip()
         entry = {
-            "handler": handler, "description": description or "Plugin command",
-            "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
+            "handler": handler, "gateway_handler": gateway_handler, "description": description or "Plugin command",
+            "plugin_context": self, "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
             "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
             else ("text" if hint else None),
         }
@@ -1157,6 +1157,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
         self._plugin_commands: Dict[str, dict] = {}
+        self._plugin_card_registry = None
         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
@@ -1447,6 +1448,14 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     def _scan_entry_points(self) -> List[PluginManifest]:
         """Read installed plugin entry points (see :func:`discover_entrypoint_manifests`)."""
         return discover_entrypoint_manifests()
+
+    @property
+    def plugin_card_registry(self):
+        with self._discovery_lock:
+            if self._plugin_card_registry is None:
+                from gateway.plugin_cards import PluginCardRegistry
+                self._plugin_card_registry = PluginCardRegistry()
+            return self._plugin_card_registry
 
     def get_slack_action_handlers(self) -> List[tuple]:
         """``(action_id, callback, plugin_name)`` tuples for the Slack adapter to wire at connect."""
@@ -2042,6 +2051,11 @@ def resolve_plugin_command_result(result: Any) -> Any:
     if "exc" in failure:
         raise failure["exc"]
     return outcome.get("value")
+
+
+def get_plugin_command_entry(name: str) -> Optional[dict]:
+    """Return the complete command entry for gateway-aware dispatch."""
+    return _ensure_plugins_discovered()._plugin_commands.get(name)
 
 
 def get_plugin_commands() -> Dict[str, dict]:

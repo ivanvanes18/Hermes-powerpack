@@ -18,6 +18,7 @@ from hermes_cli import setup_platforms
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
+from gateway.plugin_cards import validate_telegram_callback_data
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -747,6 +748,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._general_request_drain_lock = asyncio.Lock()
         self._dm_topics: Dict[str, int] = {}  # topic_name -> message_thread_id
         self._forum_command_registered: set[int] = set()  # forum chats with commands registered
+        self._plugin_card_managers: Dict[str, Any] = {}
         self._forum_lock = asyncio.Lock()
         # Status indicator: bot short description "Online"/"Offline" on connect/clean disconnect. Off by
         # default because it mutates the GLOBAL profile; opt in via extra.status_indicator.
@@ -768,6 +770,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
+        self._plugin_text_capture: Dict[tuple[str, Optional[str], str], tuple[float, Any]] = {}
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -4754,6 +4757,85 @@ class TelegramAdapter(BasePlatformAdapter):
         await query.answer(text=denial_text)
         return False
 
+    async def send_plugin_card(self, chat_id: str, card, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Render a generic plugin card; no plugin-specific Telegram code is needed."""
+        buttons = []
+        for button in card.buttons:
+            callback_data = validate_telegram_callback_data(
+                f"pc:{card.card_id}:{button.action}"
+            )
+            buttons.append(InlineKeyboardButton(button.label, callback_data=callback_data))
+        keyboard = InlineKeyboardMarkup(self._rows_of_two([
+            *buttons
+        ])) if card.buttons else None
+        return await self._send_control_message(
+            chat_id, f"<b>{_html.escape(card.title)}</b>\n\n{_html.escape(card.body)}",
+            parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            thread_id=(metadata or {}).get("thread_id"), metadata=metadata)
+
+    def bind_plugin_card_manager(self, card_id: str, manager: Any) -> None:
+        self._plugin_card_managers[card_id] = manager
+
+    def get_plugin_card_manager(self, card_id: str) -> Any:
+        """Peek without consuming; only a successfully claimed card consumes the binding."""
+        return self._plugin_card_managers.get(card_id)
+
+    def pop_plugin_card_manager(self, card_id: str) -> Any:
+        return self._plugin_card_managers.pop(card_id, None)
+
+    def arm_plugin_text_capture(self, chat_id: str, thread_id: Optional[str], callback, prompt: str = "",
+                                *, user_id: str = "", session_key: str = "") -> None:
+        if not str(user_id).strip() or not str(session_key).strip():
+            return
+        key = (str(chat_id), None if thread_id is None else str(thread_id), str(user_id))
+        self._plugin_text_capture[key] = (time.monotonic() + 15 * 60, callback)
+
+    async def _handle_plugin_card_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid card.")
+            return
+        if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
+            return
+        answered = False
+        claimed = False
+        manager = None
+        try:
+            manager = self.get_plugin_card_manager(parts[1])
+            if manager is None:
+                raise KeyError("card manager expired")
+            card = manager.plugin_card_registry.get(parts[1])
+            if card is None:
+                raise KeyError("card expired")
+            ctx = __import__("gateway.plugin_cards", fromlist=["PluginCommandContext"]).PluginCommandContext(
+                event=query, source=None, session_key=card.session_key, chat_id=str(cb["chat_id"]),
+                thread_id=cb["thread_id"], user_id=str(getattr(query.from_user, "id", "")), adapter=self,
+                request_text=self.arm_plugin_text_capture)
+            result = manager.plugin_card_registry.dispatch(parts[1], parts[2], ctx)
+            claimed = True
+            self.pop_plugin_card_manager(parts[1])
+            if asyncio.iscoroutine(result):
+                result = await result
+            await query.answer(text="Done")
+            answered = True
+            if isinstance(result, str):
+                await query.message.reply_text(result, message_thread_id=cb["thread_id"])
+        except (KeyError, PermissionError, ValueError):
+            if not answered:
+                await query.answer(text="This card expired or is not for this topic.")
+        except Exception:
+            if manager is not None and manager.plugin_card_registry.get(parts[1]) is None:
+                claimed = True
+                self.pop_plugin_card_manager(parts[1])
+            logger.warning("Plugin card callback failed safely", exc_info=True)
+            if not answered:
+                with contextlib.suppress(Exception):
+                    await query.answer(text="The card action failed safely; no repeated action is possible.")
+        finally:
+            if claimed:
+                with contextlib.suppress(Exception):
+                    await query.message.edit_reply_markup(reply_markup=None)
+
     async def _handle_callback_query(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Dispatch inline keyboard button clicks on the callback_data prefix."""
         query = update.callback_query
@@ -4770,6 +4852,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 if chat_id:
                     await handler(query, data, chat_id)
                 return
+        if data.startswith("pc:"):
+            await self._handle_plugin_card_callback(query, data, cb)
+            return
         if data.startswith("gptprof:"):
             await self._handle_gptprof_callback(query, data)
             return
@@ -6912,9 +6997,17 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        capture_key = (str(getattr(getattr(msg, "chat", None), "id", "")),
+                       self._effective_message_thread_id(msg),
+                       str(getattr(getattr(msg, "from_user", None), "id", "")))
+        capture = getattr(self, "_plugin_text_capture", {}).pop(capture_key, None)
+        if capture is not None and capture[0] > time.monotonic():
+            result = capture[1](msg.text)
+            if asyncio.iscoroutine(result):
+                await result
             return
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
