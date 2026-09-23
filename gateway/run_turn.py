@@ -206,7 +206,8 @@ class GatewayTurnMixin:
                     skey or "", model, override_model, override_runtime.get("provider"),
                 )
                 return override_model, override_runtime
-            # No api_key on the override: env-based resolution below, override model/provider on top.
+            # No api_key on the override (credentials failed to re-resolve at rehydrate): resolve them
+            # for the override's own provider below, never layer it over the default provider's runtime.
             logger.debug(
                 "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
                 skey or "", model, override_model,
@@ -229,38 +230,31 @@ class GatewayTurnMixin:
                 thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
                 parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
             )
-        # A channel/topic may prefer one credential-pool row by non-secret id. It is resolved
-        # BEFORE the runtime call so a pin without a ``provider:`` lands on the provider this
-        # channel resolves to anyway, rather than inventing one.
+        # A channel/topic may prefer one credential-pool row by non-secret id.
         preferred_credential_id = (ch.credential_id or None) if ch else None
         if preferred_credential_id and skey:
-            # A cached topic agent may already have rotated away from its configured
-            # affinity after a provider failure. Resolve the next turn with that
-            # live pool cursor while the preferred row remains benched; otherwise a
-            # fresh resolver can rebuild the cache on the failed pin and undo the
-            # recovery. The configured affinity remains unchanged and is eligible
-            # again after the pool clears its cooldown.
             cached_lookup = getattr(self, "_cached_agent_for", None)
             cached_agent = cached_lookup(skey) if callable(cached_lookup) else None
             cached_pool = getattr(cached_agent, "_credential_pool", None) if cached_agent else None
             if cached_pool is not None:
-                preferred_entry = next(
-                    (entry for entry in cached_pool.entries() if entry.id == preferred_credential_id),
-                    None,
-                )
+                preferred_entry = next((entry for entry in cached_pool.entries() if entry.id == preferred_credential_id), None)
                 current_entry = cached_pool.current()
-                if (
-                    preferred_entry is not None
-                    and preferred_entry.last_status in {"exhausted", "dead"}
-                    and current_entry is not None
-                    and current_entry.id != preferred_credential_id
-                ):
+                if preferred_entry is not None and preferred_entry.last_status in {"exhausted", "dead"} and current_entry is not None and current_entry.id != preferred_credential_id:
                     preferred_credential_id = current_entry.id
 
-        runtime_kwargs = (
-            _resolve_runtime_agent_kwargs(preferred_credential_id=preferred_credential_id)
-            if preferred_credential_id else _resolve_runtime_agent_kwargs()
-        )
+        runtime_kwargs, unavailable_override = None, None
+        if override and override.get("provider"):
+            try:
+                runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                    override["provider"], target_model=override.get("model") or None)
+            except Exception as exc:
+                logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
+                unavailable_override, override = override, None
+        if runtime_kwargs is None:
+            runtime_kwargs = (
+                _resolve_runtime_agent_kwargs(preferred_credential_id=preferred_credential_id)
+                if preferred_credential_id else _resolve_runtime_agent_kwargs()
+            )
         # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
         # runner surfaces it through the agent's one-shot fallback notice (#74349).
         self._pre_agent_fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
@@ -268,6 +262,10 @@ class GatewayTurnMixin:
         if runtime_model:
             logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
             model = runtime_model
+        if unavailable_override and not self._pre_agent_fallback_notice:
+            from hermes_cli.fallback_config import pre_agent_fallback_notice
+            self._pre_agent_fallback_notice = pre_agent_fallback_notice(
+                unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
 
         if ch:
             if ch.model:
