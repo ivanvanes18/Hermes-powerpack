@@ -49,10 +49,26 @@ def _wait_listening(port: int) -> None:
 def _drive_waiter(monkeypatch, paths: list[str]):
     """Run the real waiter on its own loop; send *paths* back-to-back once the listener is bound."""
     monkeypatch.setattr(mo.sys, "stdin", io.StringIO())  # paste reader sees EOF; the HTTP listener is under test
+    requests_done = threading.Event()
+    waiter_ident: dict[str, int] = {}
+    result_taken = mo._result_taken
+    # Keep the waiter from closing the listener between the callback response and the browser's immediate
+    # favicon fetch. The handler still sees the real latched result; only waiter cleanup is gated until the
+    # browser stand-in has received every response this regression asserts.
+    monkeypatch.setattr(
+        mo,
+        "_result_taken",
+        lambda result: (
+            requests_done.is_set() and result_taken(result)
+            if threading.get_ident() == waiter_ident.get("value")
+            else result_taken(result)
+        ),
+    )
     port = _free_port()
     out: dict = {}
 
     def run():
+        waiter_ident["value"] = threading.get_ident()
         async def main():
             with mo.force_interactive_oauth():
                 return await mo._make_callback_waiter(port, timeout=4)()
@@ -64,7 +80,10 @@ def _drive_waiter(monkeypatch, paths: list[str]):
     thread = threading.Thread(target=run)
     thread.start()
     _wait_listening(port)
-    statuses = [_get(port, p) for p in paths]
+    try:
+        statuses = [_get(port, p) for p in paths]
+    finally:
+        requests_done.set()
     thread.join(timeout=15)
     assert not thread.is_alive(), "waiter did not finish"
     assert "exc" not in out, f"waiter raised {type(out.get('exc')).__name__}"

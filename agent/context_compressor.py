@@ -96,10 +96,15 @@ def take_pinned_summary_route() -> Optional[Dict[str, Any]]:
 DETERMINISTIC_SUMMARY_ROUTE: Dict[str, Any] = {"label": "deterministic fallback summary", "deterministic": True}
 
 
+def deterministic_summary_pin_active() -> bool:
+    """Return whether this attempt owns the deterministic retry pin without consuming it."""
+    route = _SUMMARY_ROUTE_PIN.get()
+    return isinstance(route, dict) and route.get("deterministic") is True
+
+
 def take_deterministic_summary_pin() -> bool:
     """Consume the pin when it is the deterministic sentinel; a real route (or no pin) is left in place."""
-    route = _SUMMARY_ROUTE_PIN.get()
-    if not (isinstance(route, dict) and route.get("deterministic") is True):
+    if not deterministic_summary_pin_active():
         return False
     _SUMMARY_ROUTE_PIN.set(None)
     return True

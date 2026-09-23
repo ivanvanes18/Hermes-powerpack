@@ -3932,6 +3932,12 @@ def compress_context(
     """
     attempt = _begin_compression_attempt(agent, force=force, defer_notification=defer_context_engine_notification)
 
+    # The host has already admitted this bounded recovery rung. A detached primary worker may finish
+    # unwinding and re-arm its stall cooldown after the retry was selected; that cooldown protects future
+    # attempts, not this deterministic retry. Peek without consuming the pin — _summarize_window consumes it.
+    from agent.context_compressor import deterministic_summary_pin_active
+    bypass_cooldown = bypass_cooldown or deterministic_summary_pin_active()
+
     # Codex owns the real thread; route compaction to its own compact (config
     # compression.codex_app_server_auto). Memory handoff is Hermes-only: no native
     # summary prompt to inject into. `is True`: MagicMock attributes are truthy.
