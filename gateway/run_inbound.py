@@ -1086,8 +1086,9 @@ class GatewayInboundMixin:
                         from gateway.plugin_cards import PluginCommandContext, PluginCard
                         manager = __import__("hermes_cli.plugins", fromlist=["get_plugin_manager"]).get_plugin_manager()
                         adapter = self._delivery_adapter_for(source)
+                        effective_session_key = session_key or self._session_key_for_source(source)
                         card_context = PluginCommandContext(
-                            event=event, source=source, session_key=session_key,
+                            event=event, source=source, session_key=effective_session_key,
                             chat_id=str(getattr(source, "chat_id", "")),
                             thread_id=getattr(source, "thread_id", None),
                             user_id=str(getattr(source, "user_id", "")), adapter=adapter,
@@ -1277,7 +1278,7 @@ class GatewayInboundMixin:
         if not _handled:
             _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
         if not _handled:
-            _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command, _quick_key)
+            _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command)
         if not _handled:
             # Skill-slash resolution is disk-bound (cold skill scan, skill file loads, the
             # unavailable-skill rglob over every skills dir) and uncached on a first hit; on a

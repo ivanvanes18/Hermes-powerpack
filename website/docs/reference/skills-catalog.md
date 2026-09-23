@@ -46,11 +46,34 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`popular-web-designs`](../user-guide/skills/bundled/creative/creative-popular-web-designs.md) | 54 real design systems (Stripe, Linear, Vercel) as HTML/CSS. | `creative/popular-web-designs` |
 | [`songwriting-and-ai-music`](../user-guide/skills/bundled/creative/creative-songwriting-and-ai-music.md) | Songwriting craft and Suno AI music prompts. | `creative/songwriting-and-ai-music` |
 
+## decision
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`decision`](../user-guide/skills/bundled/decision/decision-decision.md) | Structure high-stakes decisions and tradeoffs. | `decision` |
+
+## design
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`refero-web-design`](../user-guide/skills/bundled/design/design-refero-web-design.md) | Design web interfaces using researched references. | `design/refero-web-design` |
+
+## design-pack
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`design-taste-frontend`](../user-guide/skills/bundled/design-pack/design-pack-design-taste-frontend.md) | Route premium frontend work to taste-skill. | `design-pack/design-taste-frontend` |
+| [`image-to-code`](../user-guide/skills/bundled/design-pack/design-pack-image-to-code.md) | Recreate web designs from reference images. | `design-pack/image-to-code` |
+| [`taste-skill`](../user-guide/skills/bundled/design-pack/design-pack-taste-skill.md) | Design distinctive, polished frontend interfaces. | `design-pack/taste-skill` |
+
 ## devops
 
 | Skill | Description | Path |
 |-------|-------------|------|
+| [`public-endpoint-ops`](../user-guide/skills/bundled/devops/devops-public-endpoint-ops.md) | Operate public HTTP endpoints safely. | `devops/public-endpoint-ops` |
 | [`sdlc-review`](../user-guide/skills/bundled/devops/devops-sdlc-review.md) | Review Kanban handoffs and route verified outcomes. | `devops/sdlc-review` |
+| [`server-doctor`](../user-guide/skills/bundled/devops/devops-server-doctor.md) | Diagnose VPS and server health safely. | `devops/server-doctor` |
+| [`supabase-project-ops`](../user-guide/skills/bundled/devops/devops-supabase-project-ops.md) | Operate Supabase projects safely. | `devops/supabase-project-ops` |
 
 ## email
 
@@ -59,11 +82,30 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`email-inbox-triage`](../user-guide/skills/bundled/email/email-email-inbox-triage.md) | Triage an inbox: prioritize threads, draft replies safely. | `email/email-inbox-triage` |
 | [`himalaya`](../user-guide/skills/bundled/email/email-himalaya.md) | Himalaya CLI: IMAP/SMTP email from terminal. | `email/himalaya` |
 
+## gptprof-hermes
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`gptprof-hermes`](../user-guide/skills/bundled/gptprof-hermes/gptprof-hermes-gptprof-hermes.md) | Manage ChatGPT profiles through Hermes and Telegram. | `gptprof-hermes` |
+
+## hallmark
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`hallmark`](../user-guide/skills/bundled/hallmark/hallmark-hallmark.md) | Design and audit distinctive web experiences. | `hallmark` |
+
+## infrastructure
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`porkbun-api-dns`](../user-guide/skills/bundled/infrastructure/infrastructure-porkbun-api-dns.md) | Manage Porkbun DNS records safely. | `infrastructure/porkbun-api-dns` |
+
 ## media
 
 | Skill | Description | Path |
 |-------|-------------|------|
 | [`gif-search`](../user-guide/skills/bundled/media/media-gif-search.md) | Search/download GIFs from Tenor via curl + jq. | `media/gif-search` |
+| [`piapi-video-toolkit`](../user-guide/skills/bundled/media/media-piapi-video-toolkit.md) | Plan PiAPI video generation workflows. | `media/piapi-video-toolkit` |
 | [`songsee`](../user-guide/skills/bundled/media/media-songsee.md) | Audio spectrograms/features (mel, chroma, MFCC) via CLI. | `media/songsee` |
 | [`youtube-content`](../user-guide/skills/bundled/media/media-youtube-content.md) | YouTube transcripts to summaries, threads, blogs. | `media/youtube-content` |
 
@@ -72,6 +114,24 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | Skill | Description | Path |
 |-------|-------------|------|
 | [`obsidian`](../user-guide/skills/bundled/note-taking/note-taking-obsidian.md) | Read, search, create, and edit notes in the Obsidian vault. | `note-taking/obsidian` |
+
+## par
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`par`](../user-guide/skills/bundled/par/par-par.md) | Run fast web and source discovery. | `par` |
+
+## perplex
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`perplex`](../user-guide/skills/bundled/perplex/perplex-perplex.md) | Research current topics with cited web sources. | `perplex` |
+
+## po
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`po`](../user-guide/skills/bundled/po/po-po.md) | Optimize rough requests into stronger prompts. | `po` |
 
 ## productivity
 
@@ -87,10 +147,17 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`notion`](../user-guide/skills/bundled/productivity/productivity-notion.md) | Notion API + ntn CLI: pages, databases, markdown, Workers. | `productivity/notion` |
 | [`pdf`](../user-guide/skills/bundled/productivity/productivity-pdf.md) | PDF files: create, read, merge, fill, OCR, edit text. | `productivity/pdf` |
 | [`powerpoint`](../user-guide/skills/bundled/productivity/productivity-powerpoint.md) | Create, read, edit .pptx decks with python-pptx. | `productivity/powerpoint` |
+| [`present`](../user-guide/skills/bundled/productivity/productivity-present.md) | Generate polished HTML presentations. | `productivity/present` |
 | [`product-price-monitor`](../user-guide/skills/bundled/productivity/productivity-product-price-monitor.md) | Watch product, flight, or listing prices; alert on target. | `productivity/product-price-monitor` |
 | [`teams-meeting-pipeline`](../user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline.md) | Teams meeting summaries, job replay, Graph subscriptions. | `productivity/teams-meeting-pipeline` |
 | [`weekly-review-planning`](../user-guide/skills/bundled/productivity/productivity-weekly-review-planning.md) | Weekly reset: commitments, stalled work, next-week plan. | `productivity/weekly-review-planning` |
 | [`xlsx`](../user-guide/skills/bundled/productivity/productivity-xlsx.md) | Create, read, edit Excel .xlsx workbooks and CSVs. | `productivity/xlsx` |
+
+## reasoning-personas
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`reasoning-personas`](../user-guide/skills/bundled/reasoning-personas/reasoning-personas-reasoning-personas.md) | Apply focused reasoning personas to hard problems. | `reasoning-personas` |
 
 ## research
 
@@ -100,6 +167,12 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`competitor-news-monitor`](../user-guide/skills/bundled/research/research-competitor-news-monitor.md) | Watch named companies for material news; cited digests. | `research/competitor-news-monitor` |
 | [`grounded-citations`](../user-guide/skills/bundled/research/research-grounded-citations.md) | Ground answers and documents in cited, verifiable sources. | `research/grounded-citations` |
 | [`llm-wiki`](../user-guide/skills/bundled/research/research-llm-wiki.md) | Karpathy's LLM Wiki: build/query interlinked markdown KB. | `research/llm-wiki` |
+
+## rp
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`rp`](../user-guide/skills/bundled/rp/rp-rp.md) | Route persona-based analysis requests. | `rp` |
 
 ## social-media
 
@@ -124,8 +197,32 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`systematic-debugging`](../user-guide/skills/bundled/software-development/software-development-systematic-debugging.md) | 4-phase root cause debugging: understand bugs before fixing. | `software-development/systematic-debugging` |
 | [`test-driven-development`](../user-guide/skills/bundled/software-development/software-development-test-driven-development.md) | TDD: enforce RED-GREEN-REFACTOR, tests before code. | `software-development/test-driven-development` |
 
+## supergoal
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`supergoal`](../user-guide/skills/bundled/supergoal/supergoal-supergoal.md) | Plan complex work before execution. | `supergoal` |
+
+## superpowers
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`superpowers`](../user-guide/skills/bundled/superpowers/superpowers-superpowers.md) | Apply a rigorous end-to-end workflow. | `superpowers` |
+
+## telegram
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`telegram-chip`](../user-guide/skills/bundled/telegram/telegram-telegram-chip.md) | Operate user-owned Telegram safely. | `telegram/telegram-chip` |
+
 ## web
 
 | Skill | Description | Path |
 |-------|-------------|------|
 | [`blocked-page-recovery`](../user-guide/skills/bundled/web/web-blocked-page-recovery.md) | Use when a fetch fails: 403/429, paywall, WAF, bot wall. | `web/blocked-page-recovery` |
+
+## webd
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`webd`](../user-guide/skills/bundled/webd/webd-webd.md) | Design conversion-focused web interfaces. | `webd` |

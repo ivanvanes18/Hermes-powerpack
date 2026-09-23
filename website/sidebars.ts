@@ -204,11 +204,43 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
+                  label: 'decision',
+                  key: 'skills-bundled-decision',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/decision/decision-decision',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'design',
+                  key: 'skills-bundled-design',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/design/design-refero-web-design',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'design-pack',
+                  key: 'skills-bundled-design-pack',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/design-pack/design-pack-design-taste-frontend',
+                    'user-guide/skills/bundled/design-pack/design-pack-image-to-code',
+                    'user-guide/skills/bundled/design-pack/design-pack-taste-skill',
+                  ],
+                },
+                {
+                  type: 'category',
                   label: 'devops',
                   key: 'skills-bundled-devops',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/devops/devops-public-endpoint-ops',
                     'user-guide/skills/bundled/devops/devops-sdlc-review',
+                    'user-guide/skills/bundled/devops/devops-server-doctor',
+                    'user-guide/skills/bundled/devops/devops-supabase-project-ops',
                   ],
                 },
                 {
@@ -223,11 +255,39 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
+                  label: 'gptprof-hermes',
+                  key: 'skills-bundled-gptprof-hermes',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/gptprof-hermes/gptprof-hermes-gptprof-hermes',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'hallmark',
+                  key: 'skills-bundled-hallmark',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/hallmark/hallmark-hallmark',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'infrastructure',
+                  key: 'skills-bundled-infrastructure',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/infrastructure/infrastructure-porkbun-api-dns',
+                  ],
+                },
+                {
+                  type: 'category',
                   label: 'media',
                   key: 'skills-bundled-media',
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/media/media-gif-search',
+                    'user-guide/skills/bundled/media/media-piapi-video-toolkit',
                     'user-guide/skills/bundled/media/media-songsee',
                     'user-guide/skills/bundled/media/media-youtube-content',
                   ],
@@ -239,6 +299,33 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/note-taking/note-taking-obsidian',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'par',
+                  key: 'skills-bundled-par',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/par/par-par',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'perplex',
+                  key: 'skills-bundled-perplex',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/perplex/perplex-perplex',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'po',
+                  key: 'skills-bundled-po',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/po/po-po',
                   ],
                 },
                 {
@@ -257,10 +344,20 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/productivity/productivity-notion',
                     'user-guide/skills/bundled/productivity/productivity-pdf',
                     'user-guide/skills/bundled/productivity/productivity-powerpoint',
+                    'user-guide/skills/bundled/productivity/productivity-present',
                     'user-guide/skills/bundled/productivity/productivity-product-price-monitor',
                     'user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline',
                     'user-guide/skills/bundled/productivity/productivity-weekly-review-planning',
                     'user-guide/skills/bundled/productivity/productivity-xlsx',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'reasoning-personas',
+                  key: 'skills-bundled-reasoning-personas',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/reasoning-personas/reasoning-personas-reasoning-personas',
                   ],
                 },
                 {
@@ -273,6 +370,15 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/research/research-competitor-news-monitor',
                     'user-guide/skills/bundled/research/research-grounded-citations',
                     'user-guide/skills/bundled/research/research-llm-wiki',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'rp',
+                  key: 'skills-bundled-rp',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/rp/rp-rp',
                   ],
                 },
                 {
@@ -306,11 +412,47 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
+                  label: 'supergoal',
+                  key: 'skills-bundled-supergoal',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/supergoal/supergoal-supergoal',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'superpowers',
+                  key: 'skills-bundled-superpowers',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/superpowers/superpowers-superpowers',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'telegram',
+                  key: 'skills-bundled-telegram',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/telegram/telegram-telegram-chip',
+                  ],
+                },
+                {
+                  type: 'category',
                   label: 'web',
                   key: 'skills-bundled-web',
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/web/web-blocked-page-recovery',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'webd',
+                  key: 'skills-bundled-webd',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/webd/webd-webd',
                   ],
                 },
               ],
