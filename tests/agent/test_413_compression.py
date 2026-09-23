@@ -499,10 +499,8 @@ class TestPreflightCompression:
             ("compacted", COMPACTION_DONE_STATUS),
         ]
 
-    def test_compress_context_announces_before_lazy_feasibility_probe(self, agent):
-        """The compacting status must land BEFORE the first-attempt feasibility probe (live catalog /
-        provider lookups): a slow probe otherwise leaves the Desktop working row on a bare spinner with no
-        \"Summarizing thread\" label (#111294). The probe's hard rejection still retires the phase."""
+    def test_direct_compress_uses_preflight_feasibility_state(self, agent):
+        """The turn preflight owns feasibility probing; direct compression only runs the lifecycle."""
         import agent.conversation_compression as cc
 
         agent.compression_enabled = True
@@ -523,19 +521,10 @@ class TestPreflightCompression:
         ):
             agent._compress_context([{"role": "user", "content": "hello"}], "system prompt", approx_tokens=1234)
 
-        assert events[:2] == [("lifecycle", COMPACTION_STATUS), ("probe", "feasibility")]
+        assert events[:2] == [("lifecycle", COMPACTION_STATUS), ("compress", "started")]
+        assert ("probe", "feasibility") not in events
         assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
-        assert agent._compression_feasibility_checked is True
-
-        # Hard rejection (aux window below minimum) propagates AND retires the announced phase.
-        agent._compression_feasibility_checked = False
-        events.clear()
-        with (
-            patch.object(cc, "check_compression_model_feasibility", side_effect=ValueError("aux too small")),
-            pytest.raises(ValueError),
-        ):
-            agent._compress_context([{"role": "user", "content": "hello"}], "system prompt", approx_tokens=1234)
-        assert events == [("lifecycle", COMPACTION_STATUS), ("compacted", COMPACTION_DONE_STATUS)]
+        assert agent._compression_feasibility_checked is False
 
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
         """A rejected lock must retire the started desktop compaction phase."""
@@ -553,8 +542,8 @@ class TestPreflightCompression:
 
         assert compressed is messages
         assert prompt == "You are helpful."
-        assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
-        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        assert [event for event, _ in events] == ["warn"]
+        assert ("compacted", COMPACTION_DONE_STATUS) not in events
 
     def test_compress_context_does_not_emit_completion_after_an_abort(self, agent):
         """An aborted summary must not claim that compaction completed."""

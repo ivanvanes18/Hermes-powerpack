@@ -5,6 +5,23 @@ from __future__ import annotations
 import pytest
 
 
+_FOREIGN_STATE_HOLDER_ISOLATED_TESTS = {
+    "test_sessions_prune_bare_keeps_90_day_default",
+    "test_sessions_prune_preview_shows_oldest_newest",
+    "test_sessions_prune_surfaces_matching_open_sessions",
+    "test_set_journal_mode_converts_wal_store_offline",
+}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_unrelated_foreign_state_holders(request, monkeypatch):
+    """Keep state-command unit tests independent of unrelated host gateways."""
+    if request.node.name not in _FOREIGN_STATE_HOLDER_ISOLATED_TESTS:
+        return
+    import hermes_state_holders
+    monkeypatch.setattr(hermes_state_holders, "foreign_state_db_holders", lambda _path: [])
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.

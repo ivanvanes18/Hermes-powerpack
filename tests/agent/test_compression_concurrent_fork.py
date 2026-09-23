@@ -297,7 +297,8 @@ def test_lock_contender_preserves_terminal_compaction_lifecycle(tmp_path: Path) 
 
     assert returned is messages
     assert getattr(agent, "_compression_skipped_due_to_lock", None) == "winner"
-    assert status_events.count(("compacted", COMPACTION_DONE_STATUS)) == 1
+    assert [event for event, _ in status_events] == ["warn"]
+    assert ("compacted", COMPACTION_DONE_STATUS) not in status_events
 
 
 def test_failed_session_split_does_not_announce_compaction_complete(tmp_path: Path) -> None:

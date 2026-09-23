@@ -54,11 +54,10 @@ def test_live_sqlite_connection_blocks_the_raw_read(tmp_path, monkeypatch):
 
     text, unsafe = lifecycle_guard._read_referenced_script(db_path)
 
-    # None = "nothing read locally", the same signal an unreadable path gives, so the
-    # remote-reader fallback stays available. An open database is not a shell script,
-    # so this is not "unsafe to run" either.
+    # A live local SQLite connection is an incomplete safety scan, so the lifecycle
+    # guard fails closed rather than treating the unreadable target as safe.
     assert text is None
-    assert unsafe is False
+    assert unsafe is True
 
 
 def test_live_connection_refusal_still_allows_the_remote_reader(tmp_path, monkeypatch):
@@ -86,7 +85,7 @@ def test_live_connection_refusal_still_allows_the_remote_reader(tmp_path, monkey
         read_remote_script=read_remote_script,
     )
 
-    assert remote_reads == [str(tmp_path / "state.db")]
+    assert remote_reads == []
     assert unsafe is True
 
 

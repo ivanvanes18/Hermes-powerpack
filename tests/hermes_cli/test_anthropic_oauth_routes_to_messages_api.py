@@ -143,7 +143,7 @@ class TestCustomProviderUrlFallback:
             def has_credentials(self):
                 return True
 
-            def select(self, **_kwargs):
+            def select(self, preferred_credential_id=None, *, model=None):
                 return _Entry()
 
         monkeypatch.setattr(rp, "custom_provider_pool_key_candidates", lambda *a, **k: ["custom:my-claude"])

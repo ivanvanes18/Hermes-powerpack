@@ -991,13 +991,6 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     requested_alias = requested_provider
     requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
-    # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on
-    # every path (background review, curator, MoA slots, delegation) instead of "Unknown provider".
-    # The pre-expansion name is what the codex_app_server overlay judges: ``openai`` is eligible,
-    # the anonymous ``custom`` it expands to is not.
-    requested_alias = requested_provider
-    requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
-    _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
     runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model,
                                             preferred_credential_id) if r)
     _raise_for_credentialless_bare_custom(requested_provider, runtime)

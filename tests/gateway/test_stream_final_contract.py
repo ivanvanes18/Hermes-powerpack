@@ -223,8 +223,8 @@ class TestFinalAdoptionGuards:
         assert adapter.draft_calls == []
 
     @pytest.mark.asyncio
-    async def test_no_stream_turn_does_not_emit_duplicate_risk_warning(self, caplog):
-        """An idle consumer leaves the normal final send as the sole delivery owner."""
+    async def test_idle_stream_consumer_emits_duplicate_risk_warning(self, caplog):
+        """An active consumer with no recorded delivery is diagnosed before normal final send."""
         from gateway.run import GatewayRunner
 
         adapter = _make_draft_adapter()
@@ -249,7 +249,7 @@ class TestFinalAdoptionGuards:
             )
 
         assert "already_sent" not in response
-        assert "Normal final-send NOT suppressed" not in caplog.text
+        assert "Normal final-send NOT suppressed" in caplog.text
 
 
 class TestQueuedLaneReconcile:

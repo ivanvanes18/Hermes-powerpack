@@ -23,6 +23,7 @@ from agent.coding_context import INTERACTIVE_CODING_PLATFORMS as _LOCAL_PLATFORM
 from agent.turn_author import a2a_key
 from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 from plugins.memory.honcho.client import _host_block, _HostLookup
+from utils import content_signature
 from plugins.memory.honcho.client import join_plugin_threads, spawn_context_thread
 from plugins.memory.honcho.dialectic import DialecticMixin
 from plugins.memory.honcho.session_peers import assistant_peer_id_for, sanitize_peer_id
@@ -693,7 +694,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             path = resolve_config_path()
             try:
                 stat = path.stat()
-                memo_key = (str(path), stat.st_mtime_ns, stat.st_size)
+                memo_key = (str(path), content_signature(path, stat))
             except OSError:
                 memo_key = (str(path), None, None)
             cached = self._identity_signature_memo.get(memo_key)

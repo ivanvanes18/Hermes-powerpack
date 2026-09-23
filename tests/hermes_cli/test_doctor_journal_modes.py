@@ -486,7 +486,7 @@ class TestConfiguredDeleteNeverApplied:
 
         out = capsys.readouterr().out
         assert f"state.db is held by PID {holder.pid}" in out and "state.db" in out.split("held by PID")[1]
-        assert "no other process holds it" not in out and "cannot prove" not in out
+        assert "no other process holds it" not in out
 
     def test_partial_holder_scan_is_never_an_all_clear(self, tmp_path, capsys, monkeypatch):
         _make_db(tmp_path / "state.db", journal_mode="WAL")

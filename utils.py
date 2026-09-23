@@ -1,6 +1,7 @@
 """Shared utility functions for hermes-agent."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -45,6 +46,16 @@ def file_signature(st: os.stat_result) -> "tuple[int, int, int, int]":
     an in-place rewrite, so the key degrades to mtime + size there rather than misfiring.
     """
     return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+
+
+def content_signature(path: Path, st: os.stat_result | None = None) -> tuple:
+    """Return a stat signature plus a streaming content digest for stale-cache detection."""
+    st = st or path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return file_signature(st), digest.hexdigest()
 
 
 def _preserve_file_mode(path: Path) -> "int | None":

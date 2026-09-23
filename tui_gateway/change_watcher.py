@@ -4,6 +4,8 @@ rebound onto server.py's globals at install time (method_ctx.bind_module)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -133,13 +135,19 @@ def _pairing_sig():
     """Newest mtime across every profile's pairing ledgers (legacy ``pairing/`` and
     ``platforms/pairing/``): the gateway process writes pending codes, so the files are the only
     shared signal (a pairing request moves nothing in gateway_state.json)."""
-    entries = []
-    for root in _pairing_roots(_watcher_home()):
+    def _root_sig(root):
         with contextlib.suppress(OSError):
-            # Only the ledgers: _rate_limits.json moves on every unauthorized DM.
-            entries += [
-                e for e in root.iterdir() if e.name.endswith(("-pending.json", "-approved.json"))]
-    return _newest_mtime_ns(entries)
+            return _newest_mtime_ns(
+                e for e in root.iterdir()
+                if e.name.endswith(("-pending.json", "-approved.json")))
+        return None
+
+    return tuple(
+        (str(root), mtime)
+        for root in _pairing_roots(_watcher_home())
+        for mtime in (_root_sig(root),)
+        if mtime is not None
+    )
 
 
 # Live-profile pairing roots, cached on (home, ``profiles/`` dir mtime) with a TTL. The liveness
@@ -147,23 +155,28 @@ def _pairing_sig():
 # profile-tree burn (#114041 §2/§3). The profile SET only moves when a dir is added or removed —
 # which bumps the parent's mtime — while a marker/tombstone landing inside one is caught by the TTL.
 _PAIRING_ROOTS_TTL_S = 30.0
-_pairing_roots_cache: tuple[Path, int | None, float, list] | None = None
+_pairing_roots_cache: tuple[Path, int | None, tuple[str, ...], float, list] | None = None
 
 
 def _pairing_roots(home: Path) -> list:
     global _pairing_roots_cache
     profiles_dir = home / "profiles"
     dir_mtime, now = _watcher_mtime_ns(profiles_dir), time.monotonic()
+    try:
+        entry_names = tuple(sorted(p.name for p in profiles_dir.iterdir()))
+    except OSError:
+        entry_names = ()
     cached = _pairing_roots_cache
-    if cached is not None and cached[0] == home and cached[1] == dir_mtime and now - cached[2] < _PAIRING_ROOTS_TTL_S:
-        return cached[3]
+    if (cached is not None and cached[0] == home and cached[1] == dir_mtime
+            and cached[2] == entry_names and now - cached[3] < _PAIRING_ROOTS_TTL_S):
+        return cached[4]
     from hermes_constants import named_profile_is_live
     roots = [home / "pairing", home / "platforms" / "pairing"]
     with contextlib.suppress(OSError):
         for profile_dir in profiles_dir.iterdir():
             if named_profile_is_live(profile_dir):
                 roots += [profile_dir / "pairing", profile_dir / "platforms" / "pairing"]
-    _pairing_roots_cache = (home, dir_mtime, now, roots)
+    _pairing_roots_cache = (home, dir_mtime, entry_names, now, roots)
     return roots
 
 

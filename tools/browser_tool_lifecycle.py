@@ -4,6 +4,7 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 """
 
 import contextlib
+
 import os
 import shutil
 import signal
@@ -713,6 +714,12 @@ def cleanup_all_browsers() -> None:
         pass
 
     _install._discover_homebrew_node_dirs.cache_clear()
+    try:
+        from hermes_cli import config as _config
+        _config._RAW_CONFIG_CACHE.clear()
+    except Exception:
+        pass
+
     # Each resolved flag flips BEFORE its cache is nulled so a concurrent reader never
     # sees ``resolved=True`` with ``cache=None``.
     for flag, cache in (

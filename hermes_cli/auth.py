@@ -16,11 +16,13 @@ import logging
 import os
 import shutil
 import shlex
+import stat
 import threading
 import time
+import uuid
 import webbrowser  # noqa: F401  (tests patch auth_mod.webbrowser.open; same module object)
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial
 from datetime import datetime, timezone
@@ -30,7 +32,7 @@ from urllib.parse import urlparse
 
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_json_write, atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
+from utils import atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
 from hermes_cli.auth_zai_kimi import (  # noqa: F401  re-exported
     KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
     _resolve_zai_base_url, detect_zai_endpoint)
@@ -491,6 +493,60 @@ def _auth_file_path() -> Path:
     return path
 
 
+def _auth_lock_path(path: Optional[Path] = None) -> Path:
+    return (path or _auth_file_path()).with_suffix(".lock")
+
+
+def _select_auth_store_owner_ids(existing_stat: Any, parent_stat: Any) -> Optional[Tuple[int, int]]:
+    """Prefer an existing non-root auth-store owner, then the parent directory owner."""
+    if existing_stat is not None and getattr(existing_stat, "st_uid", 0) != 0:
+        return int(existing_stat.st_uid), int(existing_stat.st_gid)
+    if parent_stat is not None and getattr(parent_stat, "st_uid", 0) != 0:
+        return int(parent_stat.st_uid), int(parent_stat.st_gid)
+    if existing_stat is not None:
+        return int(existing_stat.st_uid), int(existing_stat.st_gid)
+    if parent_stat is not None:
+        return int(parent_stat.st_uid), int(parent_stat.st_gid)
+    return None
+
+
+def _auth_store_owner_ids_for_root_write(path: Path) -> Optional[Tuple[int, int]]:
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    try:
+        existing_stat = path.stat()
+    except OSError:
+        existing_stat = None
+    try:
+        parent_stat = path.parent.stat()
+    except OSError:
+        parent_stat = None
+    return _select_auth_store_owner_ids(existing_stat, parent_stat)
+
+
+def _apply_auth_store_owner(path: Path, owner_ids: Optional[Tuple[int, int]]) -> None:
+    if owner_ids is None or os.name != "posix" or not hasattr(os, "chown"):
+        return
+    try:
+        os.chown(path, owner_ids[0], owner_ids[1])
+    except OSError:
+        pass
+
+
+def _repair_auth_lock_owner_for_root(lock_path: Optional[Path] = None) -> None:
+    lock_path = lock_path or _auth_lock_path()
+    owner_ids = _auth_store_owner_ids_for_root_write(lock_path)
+    if owner_ids is None:
+        return
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.touch(mode=stat.S_IRUSR | stat.S_IWUSR, exist_ok=True)
+        _apply_auth_store_owner(lock_path, owner_ids)
+        lock_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
 def _global_auth_file_path() -> Optional[Path]:
     """Global-root auth.json in profile mode; None when profile and global root are the same dir.
 
@@ -648,8 +704,9 @@ def _auth_store_lock(
     reentrancy tracker and kernel lock. Lock ordering invariant: ``_auth_store_lock`` FIRST (outer),
     ``_nous_shared_store_lock`` SECOND (inner), else deadlock against a concurrent shared import."""
     auth_path = target_path if target_path is not None else _auth_file_path()
+    _repair_auth_lock_owner_for_root(_auth_lock_path(auth_path))
     with _file_lock(
-        auth_path.with_suffix(".lock"), _auth_lock_holder_for(auth_path), timeout_seconds,
+        _auth_lock_path(auth_path), _auth_lock_holder_for(auth_path), timeout_seconds,
         "Timed out waiting for auth store lock"):
         yield
 
@@ -712,16 +769,43 @@ def _save_private_json(target: Path, data: Any, *, fsync_dir: bool = False, **du
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)
     secure_parent_dir(target)
-    atomic_json_write(target, data, mode=0o600, fsync_dir=fsync_dir, **dump_kwargs)
+    owner_ids = _auth_store_owner_ids_for_root_write(target)
+    payload = json.dumps(data, indent=2, ensure_ascii=False, **dump_kwargs) + "\n"
+    tmp_path = target.with_name(f"{target.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                     stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _apply_auth_store_owner(tmp_path, owner_ids)
+        os.replace(tmp_path, target)
+        _apply_auth_store_owner(target, owner_ids)
+        if fsync_dir:
+            try:
+                dir_fd = os.open(str(target.parent), os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+    finally:
+        with suppress(OSError):
+            tmp_path.unlink()
 
 
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
     """Atomically persist *auth_store* (0o600, parent tightened to 0o700) to the active store, or to
     an explicit *target_path* (e.g. the global-root write-through for rotating xAI OAuth grants)."""
     auth_file = target_path if target_path is not None else _auth_file_path()
+    owner_ids = _auth_store_owner_ids_for_root_write(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     _save_private_json(auth_file, auth_store, fsync_dir=True)
+    _apply_auth_store_owner(auth_file, owner_ids)
     if target_path is not None:
         # A write-through to the global root must not be masked by the mtime memo: on coarse-mtime
         # filesystems a read-after-write in the same tick would keep serving the pre-write store.

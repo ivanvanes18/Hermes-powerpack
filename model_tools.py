@@ -22,7 +22,7 @@ from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover
 from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
 from tools.arg_coercion import coerce_tool_args
-from utils import file_signature
+from utils import content_signature
 
 logger = logging.getLogger(__name__)
 
@@ -266,8 +266,8 @@ def _tool_defs_cache_key(
         return None
     try:
         from hermes_cli.config import get_config_path
-        cfg_stat = get_config_path().stat()
-        cfg_fp = file_signature(cfg_stat)
+        cfg_path = get_config_path()
+        cfg_fp = content_signature(cfg_path, cfg_path.stat())
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
     return (

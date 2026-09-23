@@ -9,6 +9,7 @@ import hashlib
 import os
 import re
 import time
+from datetime import datetime, timezone
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -176,7 +177,7 @@ async def _quiet(call, default=None):
         return default
 
 
-HISTORY_UNREADABLE = ("⚠️ Conversation history is unreadable (state.db). "
+HISTORY_UNREADABLE = ("⚠️ Conversation history is unreadable. "
                       "This is not a new conversation — earlier messages exist but cannot be loaded.")
 
 
@@ -413,6 +414,12 @@ class GatewayStatusCommandsMixin:
             updated_delta = max(0, int(time.time() - session_entry.updated_at.timestamp()))
         except Exception:
             updated_delta = 0
+        activity_at = session_row.get("last_activity_at")
+        try:
+            activity_text = (datetime.fromtimestamp(float(activity_at), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                             if activity_at else session_entry.updated_at.strftime("%Y-%m-%d %H:%M"))
+        except (TypeError, ValueError, OSError):
+            activity_text = session_entry.updated_at.strftime("%Y-%m-%d %H:%M")
         if updated_delta < 5:
             updated_text = "just now"
         elif updated_delta < 60:
@@ -438,6 +445,7 @@ class GatewayStatusCommandsMixin:
             f"{_format_status_count(context_total)} ({'~' if context_estimated else ''}{context_pct}%) · "
             f"🧹 Compactions: {compression_count}",
             f"🧵 Session: `{session_label}` • updated {updated_text}{title_suffix}",
+            f"🕘 Last activity: {activity_text}",
             f"⚙️ Execution: direct · Runtime: {runtime_label} · Think: {think} · Fast: {fast_on}",
             f"🪢 Queue: {queue_mode} (depth {queue_depth}) · Agent: {'running ⚡' if is_running else 'idle'} · Calls: {api_calls}",
             f"🔌 Platforms: {', '.join(p.value for p in self.adapters) if self.adapters else 'none'}",
@@ -456,8 +464,14 @@ class GatewayStatusCommandsMixin:
                 t("gateway.status.matrix_scope_key",
                   session_key=self._redact_matrix_session_key(session_key)),
             ]
+        try:
+            from hermes_cli.auth import resolve_provider
+            from hermes_cli.anon_auth import guest_carries_inference
+            if resolve_provider("auto") == "nous" and guest_carries_inference():
+                lines.append(t("gateway.status.free_tier"))
+        except Exception:
+            pass
         return "\n".join(lines)
-
     async def _status_session_db_facts(self, session_id: str):
         """``(title, session_row, db_total_tokens, persisted_route)`` for /status; each fail-open.
 
@@ -717,6 +731,13 @@ class GatewayStatusCommandsMixin:
         )
         if not provider and getattr(self, "_session_db", None) is not None:
             provider, base_url = await self._persisted_billing_route(source)
+        if not provider:
+            from gateway.run import _load_gateway_config
+            cfg = _quiet_sync(_load_gateway_config, {})
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            if isinstance(model_cfg, dict):
+                provider = _clean_str(model_cfg.get("provider")) or None
+                base_url = _clean_str(model_cfg.get("base_url")) or None
         if wants_reset:
             if str(provider or "").strip().lower() != "openai-codex":
                 return t("gateway.usage.reset_wrong_provider")

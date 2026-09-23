@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import json
 
 from hermes_cli import auth
 
@@ -55,3 +56,13 @@ def test_save_auth_store_applies_selected_owner_to_temp_and_final(
     )
     assert ("auth.json", (1001, 1001)) in calls
     assert auth_path.exists()
+
+
+def test_save_private_json_preserves_dump_kwargs(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "ordered.json"
+    monkeypatch.setattr(auth, "secure_parent_dir", lambda _path: None)
+    monkeypatch.setattr(auth, "_auth_store_owner_ids_for_root_write", lambda _path: None)
+
+    auth._save_private_json(target, {"z": 1, "a": 2}, sort_keys=True)
+
+    assert list(json.loads(target.read_text(encoding="utf-8"))) == ["a", "z"]

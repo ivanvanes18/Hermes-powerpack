@@ -98,7 +98,7 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
         def has_credentials(self):
             return True
 
-        def select(self, **_kwargs):
+        def select(self, preferred_credential_id=None, *, model=None):
             return _Entry()
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
@@ -123,7 +123,7 @@ def test_codex_pool_honors_hermes_codex_base_url(monkeypatch):
         def has_credentials(self):
             return True
 
-        def select(self, **_kwargs):
+        def select(self, preferred_credential_id=None, *, model=None):
             return _Entry()
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
@@ -148,7 +148,7 @@ def test_codex_pool_honors_model_base_url(monkeypatch):
         def has_credentials(self):
             return True
 
-        def select(self, **_kwargs):
+        def select(self, preferred_credential_id=None, *, model=None):
             return _Entry()
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
@@ -182,7 +182,7 @@ class TestCustomProviderPoolLoopbackNoKeyExemption:
             def has_credentials(self):
                 return True
 
-            def select(self, **_kwargs):
+            def select(self, preferred_credential_id=None, *, model=None):
                 return entry
 
         return _Pool()
@@ -496,7 +496,7 @@ def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
         def has_credentials(self):
             return True
 
-        def select(self, **_kwargs):
+        def select(self, preferred_credential_id=None, *, model=None):
             return _Entry()
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
@@ -526,7 +526,7 @@ def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeyp
         def has_credentials(self):
             return True
 
-        def select(self, **_kwargs):
+        def select(self, preferred_credential_id=None, *, model=None):
             return _Entry()
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
@@ -1112,7 +1112,7 @@ def test_explicit_openrouter_config_mirror_bypasses_pool(monkeypatch):
         def has_credentials(self):
             return True
 
-        def select(self, **_kwargs):
+        def select(self, preferred_credential_id=None, *, model=None):
             return _Entry()
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
@@ -1635,7 +1635,7 @@ def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monke
         def has_credentials(self):
             return True
 
-        def select(self, **_kwargs):
+        def select(self, preferred_credential_id=None, *, model=None):
             return _Entry()
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax-oauth")
@@ -2128,7 +2128,7 @@ def _codex_rung(monkeypatch, rung: str) -> dict:
     if rung == "pool":
         entry = SimpleNamespace(api_key="tok", runtime_api_key="tok", base_url="", source="pool")
         monkeypatch.setattr(rp, "load_pool", lambda _p: SimpleNamespace(
-            has_credentials=lambda: True, select=lambda model=None: entry))
+            has_credentials=lambda: True, select=lambda preferred_credential_id=None, *, model=None: entry))
         monkeypatch.setattr(rp, "credential_pool_matches_provider", lambda *a, **k: True)
         return {}
     monkeypatch.setattr(rp, "load_pool", lambda _p: SimpleNamespace(has_credentials=lambda: False))

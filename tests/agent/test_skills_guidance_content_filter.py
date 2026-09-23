@@ -44,14 +44,11 @@ class TestRejectedPhrasingIsGone:
             "rejects on subscription OAuth tokens (#82154)"
         )
 
-    def test_first_sentence_is_the_verified_reword(self):
-        # The reporter verified this replacement returns 200 where the original
-        # returned 400. Pin the first line so a refactor can't silently revert it.
+    def test_first_sentence_keeps_the_authorized_workflow_contract(self):
         first_line = SKILLS_GUIDANCE.split("\n", 1)[0]
-        assert first_line == (
-            "When you work out a non-trivial workflow, record it with skill_manage "
-            "for future reuse."
-        )
+        assert "authorized" in first_line.lower()
+        assert "read-only" in first_line.lower()
+        assert "skill_manage" in first_line
 
 
 class TestBehaviourIsPreserved:
@@ -62,7 +59,7 @@ class TestBehaviourIsPreserved:
         first_line = SKILLS_GUIDANCE.split("\n", 1)[0].lower()
         assert "skill_manage" in first_line
         assert "workflow" in first_line
-        assert "reuse" in first_line
+        assert "procedural knowledge" in first_line
 
     def test_patch_stale_skills_sentence_untouched(self):
         # Dieted (#95681): the patch-stale-skills coaching moved OUT of this

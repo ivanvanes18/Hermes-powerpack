@@ -311,9 +311,9 @@ class ShadowEventStore:
                     if not isinstance(owner_pid, int) or owner_pid <= 0:
                         owner_alive = False
                     else:
-                        os.kill(owner_pid, 0)
-                        owner_alive = True
-                except (ProcessLookupError, PermissionError, TypeError, ValueError, OSError):
+                        from gateway.status import _pid_exists
+                        owner_alive = bool(_pid_exists(owner_pid))
+                except (TypeError, ValueError, OSError):
                     owner_alive = False
                 if owner_alive:
                     continue

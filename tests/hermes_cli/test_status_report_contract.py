@@ -30,7 +30,7 @@ HOME = "~/.hermes-status-contract"
 
 COMMON_VALUES = (
     SESSION_ID, MODEL, PROVIDER, TITLE,
-    CREATED.strftime("%Y-%m-%d %H:%M"), UPDATED.strftime("%Y-%m-%d %H:%M"), f"{TOKENS:,}",
+    CREATED.strftime("%Y-%m-%d %H:%M"), UPDATED.strftime("%Y-%m-%d %H:%M"),
 )
 
 
@@ -109,4 +109,6 @@ def test_three_status_surfaces_report_the_same_common_fields():
     # Path is English-only (the gateway catalog has no path line); running flag is per-surface wording.
     assert HOME in outputs["cli"] and HOME in outputs["tui"]
     assert "Agent Running: Yes" in outputs["cli"] and "Agent Running: Yes" in outputs["tui"]
-    assert "Yes" in outputs["gateway"]
+    assert "Agent: running" in outputs["gateway"]
+    assert f"{TOKENS:,}" in outputs["cli"] and f"{TOKENS:,}" in outputs["tui"]
+    assert "1.2m" in outputs["gateway"]

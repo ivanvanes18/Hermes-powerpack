@@ -558,6 +558,8 @@ def test_repair_reports_success_when_the_holder_already_healed_the_db(
 _REPAIR_SCRIPT = """
 import sys, json
 sys.path.insert(0, {root!r})
+import hermes_state_holders
+hermes_state_holders.foreign_state_db_holders = lambda _path: []
 from hermes_state_repair import repair_state_db_schema
 print(json.dumps(repair_state_db_schema({db!r})), flush=True)
 """

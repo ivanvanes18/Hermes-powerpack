@@ -40,7 +40,7 @@ def _auto_maintenance(db):
         min_vacuum_freelist_ratio=-1.0)
 
 
-def test_auto_vacuum_skips_while_a_foreign_process_holds_the_store(tmp_path):
+def test_auto_vacuum_skips_while_a_foreign_process_holds_the_store(tmp_path, monkeypatch):
     db = _seeded_db(tmp_path)
     holder = subprocess.Popen(
         [sys.executable, "-c", _HOLDER, str(db.db_path)],
@@ -55,6 +55,8 @@ def test_auto_vacuum_skips_while_a_foreign_process_holds_the_store(tmp_path):
         # Control: the same call VACUUMs once the holder is gone.
         holder.stdin.close()
         holder.wait(timeout=10)
+        import hermes_state_holders
+        monkeypatch.setattr(hermes_state_holders, "foreign_state_db_holders", lambda _path: [])
         db.set_meta("last_auto_prune", "0")
         db.create_session("old2", "cli")
         db.end_session("old2", "done")

@@ -32,7 +32,8 @@ def test_oneshot_hides_skill_manage_and_skill_authoring_coaching(oneshot, intera
     prompt = build_skills_system_prompt(available_tools={"skill_view", "skills_list"}, skills_dir_override=_skills_dir(tmp_path))
     assert "demo-skill" in prompt and "skill_view" in prompt
     assert "skill_manage" not in prompt and "offer to save as a skill" not in prompt
-    assert "skill_manage" in interactive_prompt and "offer to save as a skill" in interactive_prompt
+    assert "Outside those modes, save reusable lessons" in interactive_prompt
+    assert "Outside those modes, save reusable lessons" not in prompt
 
 
 def _skills_dir(tmp_path):
@@ -45,8 +46,10 @@ def _skills_dir(tmp_path):
 @pytest.fixture
 def interactive_prompt(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
-    prompt = build_skills_system_prompt(available_tools={"skill_view", "skills_list", "skill_manage"},
-                                        skills_dir_override=_skills_dir(tmp_path))
+    with monkeypatch.context() as interactive_env:
+        interactive_env.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+        prompt = build_skills_system_prompt(available_tools={"skill_view", "skills_list", "skill_manage"},
+                                            skills_dir_override=_skills_dir(tmp_path))
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
     return prompt
 

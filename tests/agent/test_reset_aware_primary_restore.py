@@ -76,7 +76,7 @@ class _FakePool:
     def has_available(self, **_kwargs):
         return self._available
 
-    def select(self, **_kwargs):
+    def select(self, preferred_credential_id=None, *, model=None):
         return None
 
 

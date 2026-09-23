@@ -1001,9 +1001,9 @@ def _read_referenced_script(
         with offline_file_access(protected, what="read referenced script"):
             return _read_referenced_script_unlocked(path, max_bytes=max_bytes)
     except LiveConnectionError:
-        # A local SQLite owner prevents this process from reading safely, but a
-        # remote backend has independent locks and must still get a chance.
-        return None, False
+        # A live SQLite owner means the referenced file was not scanned.  Refuse
+        # it rather than treating an unscanned executable script as safe.
+        return None, True
     except (OSError, ValueError):
         # Invalid path values, including embedded NULs, are not scripts.
         return None, False

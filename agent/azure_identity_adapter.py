@@ -239,7 +239,7 @@ def _scoped_env(name: str) -> str:
 _ENV_SOURCE_CHECKS = (
     ("WorkloadIdentityCredential (AZURE_FEDERATED_TOKEN_FILE)", lambda: _scoped_env("AZURE_FEDERATED_TOKEN_FILE")),
     ("EnvironmentCredential (client secret)",
-     lambda: _scoped_env("AZURE_CLIENT_ID") and _scoped_env("AZURE_CLIENT_SECRET") and _scoped_env("AZURE_TENANT_ID")),
+     lambda: _env("AZURE_CLIENT_ID") and _scoped_env("AZURE_CLIENT_SECRET") and _env("AZURE_TENANT_ID")),
     ("ManagedIdentityCredential (IDENTITY_ENDPOINT)", lambda: _env("IDENTITY_ENDPOINT") or _env("MSI_ENDPOINT")),
 )
 

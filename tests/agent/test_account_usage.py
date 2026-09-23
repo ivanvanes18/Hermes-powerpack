@@ -105,7 +105,7 @@ def test_codex_usage_falls_back_to_native_credential_pool(monkeypatch, codex_usa
         runtime_api_key="pooled-token",
         runtime_base_url="https://chatgpt.com/backend-api/codex",
     )
-    pool = SimpleNamespace(select=lambda: pool_entry)
+    pool = SimpleNamespace(select=lambda preferred_credential_id=None, *, model=None: pool_entry)
 
     import agent.credential_pool as credential_pool
 

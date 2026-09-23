@@ -390,6 +390,11 @@ def _sidebar_singleflight_cache(func):
                     cache.popitem(last=False)
             return result
 
+    def cache_clear():
+        with cache_lock:
+            cache.clear()
+
+    setattr(wrapped, "cache_clear", cache_clear)
     return wrapped
 
 

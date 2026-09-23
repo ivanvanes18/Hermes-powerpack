@@ -97,7 +97,9 @@ def test_store_rewrites_refuse_and_name_the_holder_until_forced(action, state_db
     assert "Refusing" not in capsys.readouterr().out
 
 
-def test_prune_preview_passes_the_delete_waits_for_a_quiet_store(state_db, foreign_holder, capsys):
+def test_prune_preview_passes_the_delete_waits_for_a_quiet_store(
+    state_db, foreign_holder, capsys, monkeypatch
+):
     # A preview never rewrites anything, so it is answered even while the holder lives.
     prune_preview = _args("prune", force=False)
     prune_preview.dry_run = True
@@ -111,5 +113,7 @@ def test_prune_preview_passes_the_delete_waits_for_a_quiet_store(state_db, forei
     # Control: once the holder exits the same command runs.
     foreign_holder.stdin.close()
     foreign_holder.wait(timeout=10)
+    import hermes_state_holders
+    monkeypatch.setattr(hermes_state_holders, "foreign_state_db_holders", lambda _path: [])
     assert sessions_cmd.cmd_sessions(prune_preview) is None
     assert "Refusing" not in capsys.readouterr().out

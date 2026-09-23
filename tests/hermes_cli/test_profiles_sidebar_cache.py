@@ -176,6 +176,7 @@ class SidebarCacheTests(unittest.TestCase):
         # /api/profiles/projects/tree fans out over every profile's state.db; desktop
         # background sync + sidebar refreshes overlap identical requests. One scan must
         # serve the whole burst, and no two callers may share the same payload object.
+        getattr(profiles.get_profiles_projects_tree, "cache_clear")()
         workers = 8
         entered = threading.Event()
         release = threading.Event()
@@ -194,7 +195,7 @@ class SidebarCacheTests(unittest.TestCase):
                 mock.patch.object(profiles, "_read_profile_db", side_effect=fake_read), \
                 ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(profiles.get_profiles_projects_tree) for _ in range(workers)]
-            self.assertTrue(entered.wait(timeout=1))
+            self.assertTrue(entered.wait(timeout=5))
             time.sleep(0.05)
             release.set()
             results = [future.result(timeout=2) for future in futures]

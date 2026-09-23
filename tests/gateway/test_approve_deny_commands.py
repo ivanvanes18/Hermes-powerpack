@@ -316,8 +316,8 @@ class TestBlockingApprovalE2E:
     @pytest.mark.parametrize(
         "approval_config",
         [
-            {"mode": "manual", "timeout": 0},
-            {"mode": "manual", "timeout": 0, "gateway_timeout": 300},
+            {"mode": "manual", "timeout": 0.05},
+            {"mode": "manual", "timeout": 0.05, "gateway_timeout": 300},
         ],
         ids=["shared-timeout-only", "shared-timeout-is-canonical"],
     )

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from gateway.run_shutdown import _log_suppressed
-from utils import file_signature
+from utils import content_signature
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ def profile_serve_signature(home: "Path") -> tuple:
     for name in _PROFILE_SIGNATURE_FILES:
         try:
             st = os.stat(Path(home) / name)
-            sig.append(file_signature(st))
+            sig.append(content_signature(Path(home) / name, st))
         except OSError:
             sig.append(None)
     return tuple(sig)

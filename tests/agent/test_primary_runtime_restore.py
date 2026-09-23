@@ -325,7 +325,7 @@ class TestRestorePrimaryRuntime:
             def has_available(self, **_kwargs):
                 return True
 
-            def select(self, **_kwargs):
+            def select(self, preferred_credential_id=None, *, model=None):
                 return _Entry()
 
         agent = _make_agent(
@@ -373,7 +373,7 @@ class TestRestorePrimaryRuntime:
             def has_available(self, **_kwargs):
                 return True
 
-            def select(self, **_kwargs):
+            def select(self, preferred_credential_id=None, *, model=None):
                 return _DeepseekEntry()
 
         agent = _make_agent(
@@ -452,7 +452,7 @@ class TestRestorePrimaryRuntime:
             def has_available(self, **_kwargs):
                 return True
 
-            def select(self, **_kwargs):
+            def select(self, preferred_credential_id=None, *, model=None):
                 return _Entry()
 
         agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")

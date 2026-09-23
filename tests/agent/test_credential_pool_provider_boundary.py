@@ -208,7 +208,7 @@ def test_runtime_ignores_pool_loaded_for_different_provider(monkeypatch):
     pool = SimpleNamespace(
         provider="openai-codex",
         has_credentials=lambda: True,
-        select=lambda **_kwargs: entry,
+        select=lambda preferred_credential_id=None, *, model=None: entry,
     )
     monkeypatch.setattr(rp, "load_pool", lambda _provider: pool)
     monkeypatch.setattr(rp, "resolve_provider", lambda *_a, **_kw: "deepseek")

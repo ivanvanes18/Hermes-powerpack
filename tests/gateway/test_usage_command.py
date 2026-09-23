@@ -207,7 +207,7 @@ class TestUsageAccountSection:
             "billing_provider": "nous",
             "billing_base_url": "https://inference-api.nousresearch.com/v1/",
         }
-        runner._session_db._db.get_recent_session_model_route.return_value = {
+        runner._session_db._db.get_dominant_session_model_route.return_value = {
             "model": "z-ai/glm-5.2",
             "billing_provider": "nvidia",
             "billing_base_url": "https://integrate.api.nvidia.com/v1/",
