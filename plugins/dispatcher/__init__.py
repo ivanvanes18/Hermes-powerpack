@@ -112,7 +112,10 @@ def register(ctx) -> None:
             return _refresh(ctx)
         tasks = _tasks(ctx)
         if not tasks:
-            return "No dispatcher tasks are registered. Use /dispatcher refresh."
+            refresh_result = _refresh(ctx)
+            tasks = _tasks(ctx)
+            if not tasks:
+                return refresh_result
         cards = []
         for task in tasks:
             def action(action_name, card_context, task_id=task["id"]):

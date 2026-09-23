@@ -32,6 +32,19 @@ def test_dispatcher_empty_registry_is_explicit_and_has_no_demo_task():
     assert ctx.args[1]() == "No dispatcher tasks are registered. Use /dispatcher refresh."
 
 
+def test_gateway_command_auto_refreshes_canonical_registry_when_state_is_empty(monkeypatch):
+    ctx = Ctx()
+    register(ctx)
+    refreshed = [task("one", "card-one", status="ПРЕРВАНО")]
+    monkeypatch.setattr("plugins.dispatcher._refresh", lambda plugin_ctx: (plugin_ctx.state.set("tasks", refreshed) or "ok"))
+
+    cards = ctx.kwargs["gateway_handler"](
+        PluginCommandContext(None, None, "dispatcher-session", "42", "7", "9")
+    )
+
+    assert [card.card_id for card in cards] == ["card-one"]
+
+
 def test_dispatcher_renders_all_tasks_as_cards_and_continuation_is_fail_closed():
     ctx = Ctx([task("one", "card-one"), task("two", "card-two", "other-session", "blocked")])
     register(ctx)
