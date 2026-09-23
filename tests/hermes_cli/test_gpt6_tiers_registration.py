@@ -1,9 +1,9 @@
-"""Behavior contracts for the GPT-6 Sol/Terra/Luna registration (the 5.6 tier successors).
+"""Behavior contracts for the GPT-6 Sol/Luna registration (the 5.6 tier successors).
 
 Invariant tests only, no list snapshots. They pin what would silently regress:
 
-1. `/model gpt` still lands on the flagship: Astra outranks Sol, Sol outranks
-   Terra/Luna, and every GPT-6 tier outranks its 5.6 predecessor.
+1. `/model gpt` still lands on the flagship: Astra outranks Sol, Luna, and every
+   GPT-6 tier outranks its 5.6 predecessor.
 2. The Codex OAuth `-900k` opt-in machinery treats the gpt-6 tiers exactly like
    the 5.6 ones: picker synthesis, dated snapshots, wire stripping, the
    compaction auto-raise on the base slug (and not on the variant), and the

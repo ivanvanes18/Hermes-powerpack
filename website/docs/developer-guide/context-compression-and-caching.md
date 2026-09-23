@@ -372,7 +372,7 @@ hermes config set compression.codex_gpt55_autoraise_notice false
 ### Codex large-context `-900k` picker variants (opt-in)
 
 The ChatGPT Codex backend *advertises* a 272K window for the gpt-5.4, gpt-5.6
-(Sol/Terra/Luna) and GPT-6 (Sol/Terra/Luna) families, but actually accepts ~911K input tokens
+(Sol/Terra/Luna) and GPT-6 (Sol/Luna) families, but actually accepts ~911K input tokens
 for ChatGPT-subscription accounts (live-verified Aug 2026). Hermes keeps the
 **advertised 272K as the default** for the base slugs — a bigger window means
 more tokens per request and much faster subscription-usage burn, so the large
