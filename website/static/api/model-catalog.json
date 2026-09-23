@@ -69,11 +69,11 @@
           "description": "0.5x price, flex tier"
         },
         {
-          "id": "openai/gpt-5.6-sol",
+          "id": "openai/gpt-6-sol",
           "description": ""
         },
         {
-          "id": "openai/gpt-5.6-sol-pro",
+          "id": "openai/gpt-6-sol-pro",
           "description": ""
         },
         {
@@ -85,11 +85,11 @@
           "description": ""
         },
         {
-          "id": "openai/gpt-5.6-luna",
+          "id": "openai/gpt-6-luna",
           "description": ""
         },
         {
-          "id": "openai/gpt-5.6-luna-pro",
+          "id": "openai/gpt-6-luna-pro",
           "description": ""
         },
         {
@@ -301,10 +301,10 @@
           "id": "openai/gpt-6-astra-pro-flex"
         },
         {
-          "id": "openai/gpt-5.6-sol"
+          "id": "openai/gpt-6-sol"
         },
         {
-          "id": "openai/gpt-5.6-sol-pro"
+          "id": "openai/gpt-6-sol-pro"
         },
         {
           "id": "openai/gpt-5.6-terra"
@@ -313,10 +313,10 @@
           "id": "openai/gpt-5.6-terra-pro"
         },
         {
-          "id": "openai/gpt-5.6-luna"
+          "id": "openai/gpt-6-luna"
         },
         {
-          "id": "openai/gpt-5.6-luna-pro"
+          "id": "openai/gpt-6-luna-pro"
         },
         {
           "id": "openai/gpt-5.5"
