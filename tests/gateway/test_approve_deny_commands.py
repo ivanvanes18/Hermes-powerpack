@@ -316,8 +316,8 @@ class TestBlockingApprovalE2E:
     @pytest.mark.parametrize(
         "approval_config",
         [
-            {"mode": "manual", "timeout": 0.05},
-            {"mode": "manual", "timeout": 0.05, "gateway_timeout": 300},
+            {"mode": "manual", "timeout": 1},
+            {"mode": "manual", "timeout": 1, "gateway_timeout": 300},
         ],
         ids=["shared-timeout-only", "shared-timeout-is-canonical"],
     )
@@ -329,7 +329,8 @@ class TestBlockingApprovalE2E:
 
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
         session_key = "e2e-timeout"
-        register_gateway_notify(session_key, lambda d: None)
+        notified = threading.Event()
+        register_gateway_notify(session_key, lambda d: notified.set())
 
         result_holder = [None]
 
@@ -354,7 +355,8 @@ class TestBlockingApprovalE2E:
 
         t = threading.Thread(target=agent_thread)
         t.start()
-        t.join(timeout=1)
+        assert notified.wait(timeout=5), "approval request was not registered"
+        t.join(timeout=5)
         if t.is_alive():
             resolve_gateway_approval(session_key, "deny")
             t.join(timeout=5)

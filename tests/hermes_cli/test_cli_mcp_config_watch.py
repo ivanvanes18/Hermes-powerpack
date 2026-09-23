@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from utils import file_signature
+from utils import content_signature
 
 
 def _make_cli(tmp_path, mcp_servers=None, extra_config=None):
@@ -20,7 +20,7 @@ def _make_cli(tmp_path, mcp_servers=None, extra_config=None):
 
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("mcp_servers: {}\n")
-    obj._config_sig = file_signature(cfg_file.stat())
+    obj._config_sig = content_signature(cfg_file)
 
     obj._reload_mcp = MagicMock()
     obj._busy_command = MagicMock()
@@ -215,7 +215,7 @@ def test_tui_init_run_state_seeds_config_sig_when_config_exists(monkeypatch):
     obj.config = {"mcp_servers": {}}
     obj._tui_init_run_state()
 
-    assert obj._config_sig == file_signature(cfg_file.stat())
+    assert obj._config_sig == content_signature(cfg_file)
 
 
 def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
@@ -225,11 +225,12 @@ def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
 
     obj, cfg_file = _make_cli(tmp_path, mcp_servers={"bb": {"command": "b"}})
     cfg_file.write_text("mcp_servers:\n  bb: {command: b}\n")
-    obj._config_sig = file_signature(cfg_file.stat())
+    obj._config_sig = content_signature(cfg_file)
     other = tmp_path / "other.yaml"
     other.write_text("mcp_servers:\n  aa: {command: a}\n")
     shutil.copy2(other, cfg_file)
-    os.utime(cfg_file, ns=(obj._config_sig[0], obj._config_sig[0]))
+    pinned_mtime = obj._config_sig[0][0]
+    os.utime(cfg_file, ns=(pinned_mtime, pinned_mtime))
 
     with patch("hermes_cli.config.get_config_path", return_value=cfg_file):
         obj._check_config_mcp_changes()
