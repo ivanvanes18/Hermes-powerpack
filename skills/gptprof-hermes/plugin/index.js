@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 const Type = {
   String: (options = {}) => ({ type: "string", ...options }),
   Optional: (schema) => ({ ...schema, optional: true }),
@@ -25,11 +26,12 @@ const Type = {
 const DEFAULT_MANAGER_CANDIDATES = [
   process.env.GPTPROF_MANAGER_PATH,
   process.env.CODEX_PROFILE_MANAGER,
+  fileURLToPath(new URL("../bin/codex-profile-manager.py", import.meta.url)),
   `${process.env.HOME || ""}/.local/bin/codex-profile-manager.py`,
   "/usr/local/bin/codex-profile-manager.py",
 ].filter(Boolean);
 const DEFAULT_PYTHON = process.env.GPTPROF_PYTHON || "python3";
-const DEFAULT_TIMEOUT_MS = 12_000;
+const DEFAULT_TIMEOUT_MS = 75_000;
 
 function asObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -512,8 +514,10 @@ async function handleTextCommand(args, config) {
         "Approve it, then send /gptprof check again.",
       ].join("\n");
     }
-    if (config.restartAfterSwitch) scheduleRestart();
-    return `Added and switched GPT profile to ${checked.active}. Gateway restart scheduled.`;
+    const credential = checked.credentialId || "the Hermes credential pool";
+    return checked.added === false
+      ? `GPT credential ${credential} is already present in Hermes CredentialPool.`
+      : `Added GPT credential ${credential} to Hermes CredentialPool.`;
   }
   if (action === "use-pi" || action === "pi" || action === "route-pi" || action === "back-pi") {
     const routed = await managerJson(config, ["apply-pi-route"]);
@@ -667,8 +671,11 @@ async function handleInteractive(ctx, config) {
       return { handled: true };
     }
     const status = await managerJson(config, ["status"]);
-    await ctx.respond?.editMessage?.({ text: `Added and switched GPT profile to ${checked.active}.\nGateway restart scheduled.\n\n${statusText(status)}`, buttons: profileButtons(status) });
-    if (config.restartAfterSwitch) scheduleRestart();
+    const credential = checked.credentialId || "the Hermes credential pool";
+    const resultText = checked.added === false
+      ? `GPT credential ${credential} is already present in Hermes CredentialPool.`
+      : `Added GPT credential ${credential} to Hermes CredentialPool.`;
+    await ctx.respond?.editMessage?.({ text: `${resultText}\n\n${statusText(status)}`, buttons: profileButtons(status) });
     return { handled: true };
   }
   const before = await managerJson(config, ["status"]);

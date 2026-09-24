@@ -116,11 +116,29 @@ async def test_gptprof_new_auth_renders_only_safe_device_flow_fields(monkeypatch
     )
     spawn = AsyncMock(return_value=proc)
     monkeypatch.setattr(telegram_adapter_module.asyncio, "create_subprocess_exec", spawn)
+    timeouts = []
+
+    async def capture_timeout(awaitable, *, timeout):
+        timeouts.append(timeout)
+        return await awaitable
+
+    monkeypatch.setattr(telegram_adapter_module.asyncio, "wait_for", capture_timeout)
     query = _make_query()
 
     await _make_adapter()._run_gptprof_profile_action(query, "new_auth")
 
-    assert spawn.await_args.args[-1] == "device-start"
+    expected_manager = (
+        Path(telegram_adapter_module.__file__).resolve().parents[3]
+        / "skills"
+        / "gptprof-hermes"
+        / "bin"
+        / "codex-profile-manager.py"
+    )
+    spawn_call = spawn.await_args
+    assert spawn_call is not None
+    assert Path(spawn_call.args[1]) == expected_manager
+    assert spawn_call.args[-1] == "device-start"
+    assert timeouts == [75]
     query.answer.assert_awaited_once_with(
         text="Open https://auth.openai.com/codex/device and enter code ABCD-EFGH",
         show_alert=True,

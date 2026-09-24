@@ -5344,13 +5344,19 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,
-                os.path.expanduser("~/.local/bin/codex-profile-manager.py"),
+                str(
+                    _Path(__file__).resolve().parents[3]
+                    / "skills"
+                    / "gptprof-hermes"
+                    / "bin"
+                    / "codex-profile-manager.py"
+                ),
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_gptprof_callback_env(query),
             )
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=75)
             payload = json.loads(stdout.decode("utf-8")) if proc.returncode == 0 else {}
             if not isinstance(payload, dict):
                 payload = {}

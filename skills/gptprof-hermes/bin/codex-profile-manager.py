@@ -3,11 +3,14 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +33,12 @@ USAGE_BASE_URL = "https://chatgpt.com/backend-api/wham/usage"
 DEVICE_CALLBACK_URL = f"{AUTH_BASE_URL}/deviceauth/callback"
 DEVICE_VERIFY_URL = f"{AUTH_BASE_URL}/codex/device"
 DEVICE_TIMEOUT_SECONDS = 15 * 60
+# Device auth is a Hermes-owned flow: the pending record and the resulting
+# OAuth grant belong to the canonical Hermes home, never to ~/.openclaw or
+# ~/.codex (which the Hermes runtime never reads).
+POOL_PROVIDER = "openai-codex"
+POOL_ENTRY_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+DEVICE_LOCK_HOLDER = threading.local()
 REFRESH_AFTER_DAYS = 8
 SWITCH_THRESHOLD = 95.0
 USAGE_CACHE_MAX_AGE_SECONDS = 15 * 60
@@ -843,6 +852,88 @@ def http_json(url, payload=None, headers=None, timeout=20):
         return e.code, parsed
 
 
+def device_state_path():
+    """Profile-aware pending-device-auth record under the canonical Hermes home."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "gptprof" / "device-auth.json"
+
+
+def load_device_state():
+    state = load_json(device_state_path(), {}) or {}
+    return state if isinstance(state, dict) else {}
+
+
+def save_device_state(state):
+    write_json_atomic(device_state_path(), state, mode=0o600)
+
+
+def device_state_lock():
+    """Serialize the split device flow across gateway/helper processes."""
+    from hermes_cli.auth import _file_lock
+    from hermes_cli.auth_constants import AUTH_LOCK_TIMEOUT_SECONDS
+
+    return _file_lock(
+        device_state_path().with_suffix(".lock"),
+        DEVICE_LOCK_HOLDER,
+        AUTH_LOCK_TIMEOUT_SECONDS,
+        "Timed out waiting for gptprof device-auth lock",
+    )
+
+
+def pending_device_auth():
+    with device_state_lock():
+        pending = load_device_state().get("pendingDeviceAuth")
+    return pending if isinstance(pending, dict) else None
+
+
+def pool_entry_id(email, taken):
+    """Short callback-safe id; never the ``gptprof:`` form reserved for bootstrap slugs."""
+    base = "codex-device"
+    if email:
+        local = POOL_ENTRY_ID_CHARS.sub("-", email.split("@", 1)[0])[:16].strip("-.")
+        if local:
+            base = f"codex-{local}"
+    entry_id = base
+    while entry_id in taken:
+        entry_id = f"{base}-{uuid.uuid4().hex[:4]}"
+    return entry_id
+
+
+def store_codex_device_credential(access, refresh, auth):
+    """Append the newly authorized account to the canonical Hermes CredentialPool.
+
+    Returns ``(credential_id, added)``; a re-delivered token pair resolves to the
+    existing row instead of appending a duplicate.
+    """
+    from agent.credential_pool import (
+        AUTH_TYPE_OAUTH, SOURCE_MANUAL_DEVICE_CODE, PooledCredential, load_pool,
+    )
+    from hermes_cli.auth_constants import DEFAULT_CODEX_BASE_URL
+
+    pool = load_pool(POOL_PROVIDER)
+    entries = pool.entries()
+    for entry in entries:
+        if entry.access_token == access and entry.refresh_token == refresh:
+            return entry.id, False
+    email = auth_email(auth)
+    entry_id = pool_entry_id(email, {entry.id for entry in entries})
+    added = pool.add_entry(PooledCredential(
+        provider=POOL_PROVIDER,
+        id=entry_id,
+        label=email or entry_id,
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,  # add_entry reassigns the next free priority
+        source=SOURCE_MANUAL_DEVICE_CODE,
+        access_token=access,
+        refresh_token=refresh,
+        base_url=DEFAULT_CODEX_BASE_URL,
+        expires_at_ms=token_exp_ms(auth),
+        last_refresh=now_iso(),
+    ))
+    return added.id, True
+
+
 def device_headers(content_type):
     headers = {
         "Content-Type": content_type,
@@ -868,16 +959,18 @@ def device_start():
         raise RuntimeError("OpenAI device code response was missing device_auth_id or user_code")
     interval = payload.get("interval")
     interval_seconds = int(interval) if isinstance(interval, (int, float)) and interval > 0 else 5
-    state = load_state()
-    state["pendingDeviceAuth"] = {
-        "deviceAuthId": device_auth_id,
-        "userCode": user_code,
-        "verificationUrl": DEVICE_VERIFY_URL,
-        "createdAt": now_iso(),
-        "expiresAt": int(time.time()) + DEVICE_TIMEOUT_SECONDS,
-        "intervalSeconds": interval_seconds,
-    }
-    save_state(state)
+    with device_state_lock():
+        state = load_device_state()
+        state["pendingDeviceAuth"] = {
+            "attemptId": uuid.uuid4().hex,
+            "deviceAuthId": device_auth_id,
+            "userCode": user_code,
+            "verificationUrl": DEVICE_VERIFY_URL,
+            "createdAt": now_iso(),
+            "expiresAt": int(time.time()) + DEVICE_TIMEOUT_SECONDS,
+            "intervalSeconds": interval_seconds,
+        }
+        save_device_state(state)
     return {
         "ok": True,
         "verificationUrl": DEVICE_VERIFY_URL,
@@ -888,15 +981,20 @@ def device_start():
 
 
 def device_check():
-    state = load_state()
-    pending = state.get("pendingDeviceAuth") if isinstance(state.get("pendingDeviceAuth"), dict) else None
-    if not pending:
-        return {"ok": False, "pending": False, "error": "no_pending_device_auth"}
-    expires_at = pending.get("expiresAt")
-    if isinstance(expires_at, int) and time.time() > expires_at:
-        state.pop("pendingDeviceAuth", None)
-        save_state(state)
-        return {"ok": False, "pending": False, "error": "device_auth_expired"}
+    # Snapshot one attempt under lock, then release it before network I/O. The
+    # attempt id is revalidated before cleanup so a concurrent device-start is
+    # never erased by this older check.
+    with device_state_lock():
+        state = load_device_state()
+        pending = state.get("pendingDeviceAuth") if isinstance(state.get("pendingDeviceAuth"), dict) else None
+        if not pending:
+            return {"ok": False, "pending": False, "error": "no_pending_device_auth"}
+        pending = dict(pending)
+        expires_at = pending.get("expiresAt")
+        if isinstance(expires_at, int) and time.time() > expires_at:
+            state.pop("pendingDeviceAuth", None)
+            save_device_state(state)
+            return {"ok": False, "pending": False, "error": "device_auth_expired"}
     status, payload = http_json(
         f"{AUTH_BASE_URL}/api/accounts/deviceauth/token",
         {"device_auth_id": pending.get("deviceAuthId"), "user_code": pending.get("userCode")},
@@ -941,31 +1039,33 @@ def device_check():
     refresh = token_payload.get("refresh_token")
     if not isinstance(access, str) or not access or not isinstance(refresh, str) or not refresh:
         raise RuntimeError("OpenAI token exchange succeeded without required tokens")
-    auth = {
-        "auth_mode": "chatgpt",
-        "OPENAI_API_KEY": "",
-        "tokens": {
-            "access_token": access,
-            "refresh_token": refresh,
-        },
-        "seeded_at": now_iso(),
-        "last_refresh": now_iso(),
-    }
+    # Claim carrier only — never persisted; the tokens go to the Hermes pool.
+    auth = {"tokens": {"access_token": access, "refresh_token": refresh}}
     if isinstance(token_payload.get("id_token"), str) and token_payload["id_token"]:
         auth["tokens"]["id_token"] = token_payload["id_token"]
-    email = auth_email(auth)
-    if not email:
-        raise RuntimeError("OpenAI device auth succeeded but no email claim was available")
-    slug = slug_for_email(email)
-    auth["email"] = email
-    auth["profile_slug"] = slug
-    write_json_atomic(profile_auth_path(slug), auth)
-    state.pop("pendingDeviceAuth", None)
-    save_state(state)
-    switched = switch_profile(slug, reason="device-auth")
-    return {"ok": True, "pending": False, "active": slug, "email": email, "switch": switched}
-
-
+    credential_id, added = store_codex_device_credential(access, refresh, auth)
+    cleanup_warning = False
+    try:
+        with device_state_lock():
+            state = load_device_state()
+            current = state.get("pendingDeviceAuth")
+            if (
+                isinstance(current, dict)
+                and current.get("attemptId") == pending.get("attemptId")
+            ):
+                state.pop("pendingDeviceAuth", None)
+                save_device_state(state)
+    except OSError:
+        cleanup_warning = True
+    return {
+        "ok": True,
+        "pending": False,
+        "provider": POOL_PROVIDER,
+        "credentialId": credential_id,
+        "added": added,
+        "email": auth_email(auth),
+        "cleanupWarning": cleanup_warning,
+    }
 def extract_error(payload):
     err = payload.get("error") if isinstance(payload, dict) else None
     if isinstance(err, dict):
@@ -1120,7 +1220,7 @@ def main():
                     "mode": "lazy-on-demand",
                     "timer": False,
                 },
-                "pendingDeviceAuth": state.get("pendingDeviceAuth") if isinstance(state.get("pendingDeviceAuth"), dict) else None,
+                "pendingDeviceAuth": pending_device_auth(),
             }
         elif args.cmd == "switch":
             out = switch_profile(args.slug, reason="manual")

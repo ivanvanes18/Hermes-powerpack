@@ -28,7 +28,7 @@ Hermes-native skill for ChatGPT profile management: Telegram card with inline bu
 | Slash | Action |
 |-------|--------|
 | `/gptprof` | Show profile selection card with inline buttons (remaining % 5h / weekly per button) |
-| `/gptt` | Switch to `gpt-5.6-sol` via `openai-codex` provider, **persistent** (`--global`) |
+| `/gptt` | Switch to `gpt-6-sol-900k` via `openai-codex` provider, **persistent** (`--global`) |
 | `/mmfast` | Switch back to `MiniMax-M3` with high reasoning, **persistent** (`--global`) |
 | `/gptprof autoswitch` | Run autoswitch logic (switches when active 5h or weekly remaining is ≤5%, or usage/auth error appears) |
 
@@ -52,7 +52,7 @@ On `gptprof:<slug>:<model>` callback, the Telegram adapter:
 2. **Writes global config.yaml**:
    ```python
    cfg["model"] = {
-       "default": model,         # e.g. "gpt-5.6-sol"
+       "default": model,         # e.g. "gpt-6-sol-900k"
        "provider": "openai-codex",
    }
    ```
@@ -153,7 +153,7 @@ agent:
 quick_commands:
   gptt:
     type: alias
-    target: /model gpt-5.6-sol --provider openai-codex --global
+    target: /model gpt-6-sol-900k --provider openai-codex --global
   mmfast:
     type: alias
     target: /model MiniMax-M3 --provider minimax --global
@@ -178,6 +178,15 @@ HERMES_PYTHON=/path/to/hermes/.venv/bin/python
 install -m 700 "$SKILL_DIR/bin/send_buttons.py"       ~/.local/bin/gptprof_send_buttons.py
 install -m 700 "$SKILL_DIR/bin/refresh_profiles.py"   ~/.local/bin/gptprof_refresh_profiles.py
 install -m 700 "$SKILL_DIR/bin/gptprof_autoswitch.py" ~/.local/bin/gptprof_autoswitch.py
+install -m 700 "$SKILL_DIR/bin/codex-profile-manager.py" ~/.local/bin/codex-profile-manager.py
+
+# Autoswitch imports send_buttons.py by its sibling filename. When binaries are
+# renamed with a gptprof_ prefix, also install this private companion copy.
+install -m 700 "$SKILL_DIR/bin/send_buttons.py" ~/.local/bin/send_buttons.py
+
+# For a system-level multi-user autoswitch timer, set PrivateTmp=true in its
+# oneshot service: the usage cache currently uses /tmp/gptprof_usage_cache.json,
+# so a shared /tmp can collide with another Unix user's mode-0600 cache.
 
 # Optional manual fallback target. Hermes `/gptprof` quick-command calls
 # automatically route to the invoking chat/topic.
