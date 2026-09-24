@@ -232,6 +232,23 @@ def _pool_serves_endpoint(pool: Any, provider: Optional[str], base_url: Optional
     entries = entries_fn()
     return not isinstance(entries, list) or any(_entry_serves_endpoint(entry, base_url) for entry in entries)
 
+def _reconciled_parent_pool(parent_pool, provider: str):
+    """The parent's pool object, first reconciled with the provider's pool store.
+
+    The parent holds its pool for the life of its session, so a credential added after
+    the parent agent was built is invisible to it — and to every child that shares the
+    object. Without this the child's 429 recovery saw one row, logged "no available
+    entries" and activated the configured external fallback while a usable second OAuth
+    row sat in the store. Reconciliation is additive (see
+    ``CredentialPool.reconcile_with_store``), so the shared object, its active leases and
+    its rotation cursor survive; any failure leaves the parent pool exactly as it was.
+    """
+    try:
+        parent_pool.reconcile_with_store()
+    except Exception as exc:
+        logger.debug("Could not reconcile the shared '%s' credential pool with its store: %s", provider, exc)
+    return parent_pool
+
 def _resolve_child_credential_pool(
     effective_provider: Optional[str], parent_agent, effective_base_url: Optional[str] = None,
     effective_requested_provider: Optional[str] = None,
@@ -270,7 +287,7 @@ def _resolve_child_credential_pool(
             return _loaded_pool(child_key)
         if parent_pool is not None and effective_provider == parent_provider:
             if not effective_base_url or _pool_serves_endpoint(parent_pool, effective_provider, effective_base_url):
-                return parent_pool
+                return _reconciled_parent_pool(parent_pool, effective_provider)
             logger.debug("Parent %s pool has no entry for child endpoint %s; not sharing it",
                          effective_provider, effective_base_url)
         pool = _loaded_pool(effective_provider)

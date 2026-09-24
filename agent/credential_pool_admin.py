@@ -113,6 +113,57 @@ class CredentialPoolAdminMixin:
                 return None, None, f"No credential #{index}."
             return None, None, f'No credential matching "{raw}".'
 
+    def reconcile_with_store(self) -> int:
+        """Admit pool-store rows added after this pool object was built; returns how many.
+
+        A long-lived agent holds one ``CredentialPool`` for its whole session, so a
+        credential added later (``hermes auth add``, a second OAuth login) never reaches
+        it — and neither does a delegated child that shares that pool object. On a 429
+        such a pool reports "no available entries" and the caller drops to its external
+        provider fallback while a usable row sits in the store (a sibling agent built
+        after the row landed rotates onto it correctly).
+
+        Additive by contract: every entry already in the pool is left exactly as it is,
+        so a fresher in-memory single-use OAuth rotation is never clobbered by staler
+        disk bytes, and a row absent from the store is never dropped (it may back an
+        active lease, or be invisible to this profile's view of the store). Object
+        identity, ``_active_leases`` and ``_current_id`` all survive. Newcomers land
+        AFTER the existing rows, so the credential the pool is currently on keeps its
+        priority and the new row becomes the next rotation target rather than jumping
+        the queue. A reload that fails leaves the pool untouched (returns 0).
+        """
+        from agent.credential_pool import _next_priority, load_pool, logger
+
+        try:
+            # Outside the pool lock: load_pool() takes the cross-process auth-store lock.
+            fresh_entries = load_pool(self.provider).entries()
+        except Exception as exc:
+            logger.debug("credential pool: could not reload the %s store: %s", self.provider, exc)
+            return 0
+
+        with self._lock:
+            known_ids = {entry.id for entry in self._entries}
+            # Ids are persisted, but a row the store could not write keeps a fresh
+            # random id on every load; matching the runtime key too stops a repeatedly
+            # reconciled pool from growing a duplicate of the same credential.
+            known_keys = {key for key in (entry.runtime_api_key for entry in self._entries) if key}
+            admitted = []
+            for entry in fresh_entries:
+                if entry.id in known_ids or (entry.runtime_api_key and entry.runtime_api_key in known_keys):
+                    continue
+                self._entries.append(replace(entry, priority=_next_priority(self._entries)))
+                known_ids.add(entry.id)
+                if entry.runtime_api_key:
+                    known_keys.add(entry.runtime_api_key)
+                admitted.append(entry)
+            if admitted:
+                logger.info(
+                    "credential pool: admitted %d new %s credential(s) from the store (%s)",
+                    len(admitted), self.provider,
+                    ", ".join(entry.label or entry.id[:8] for entry in admitted),
+                )
+            return len(admitted)
+
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
         from agent.credential_pool import _next_priority, write_credential_pool
 
