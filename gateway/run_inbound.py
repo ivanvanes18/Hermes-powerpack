@@ -1016,7 +1016,9 @@ class GatewayInboundMixin:
             return await getattr(self, f"_hm_cmd_{canonical}")(event, source, _quick_key)
         return False, None
 
-    async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str, source: SessionSource) -> str:
+    async def _hm_run_exec_quick_command(
+        self, command: str, exec_cmd: str, source: SessionSource, *, silent: bool = False,
+    ) -> Optional[str]:
         """Run a ``type: exec`` quick command in the gateway process (30 s cap, sanitized env — the
         gateway process has every API key in os.environ; output is redacted too)."""
         try:
@@ -1031,6 +1033,8 @@ class GatewayInboundMixin:
             if output:
                 from agent.redact import redact_sensitive_text
                 output = redact_sensitive_text(output, force=True)
+            if silent and proc.returncode == 0:
+                return None  # `silent: true`: the command reports on its own; stay quiet on success
             return output or "Command returned no output."
         except asyncio.TimeoutError:
             return "Quick command timed out (30s)."
@@ -1061,7 +1065,9 @@ class GatewayInboundMixin:
                 exec_cmd = qcmd.get("command", "")
                 if not exec_cmd:
                     return True, f"Quick command '/{command}' has no command defined.", command
-                return True, await self._hm_run_exec_quick_command(command, exec_cmd, source), command
+                return True, await self._hm_run_exec_quick_command(
+                    command, exec_cmd, source, silent=bool(qcmd.get("silent")),
+                ), command
             if qtype != "alias":
                 return True, f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias').", command
             new_command = self._hm_expand_alias_quick_command(event, qcmd)

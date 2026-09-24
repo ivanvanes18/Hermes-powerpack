@@ -142,3 +142,41 @@ async def test_quick_command_spawn_error_is_generic(monkeypatch):
 
     assert result == "Quick command failed."
     assert "synthetic-secret-value" not in result
+
+
+def _silent_runner(returncode, stdout, stderr=b""):
+    import gateway.run_inbound as run_inbound
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = {"quick_commands": {"notify": {"type": "exec", "command": "helper", "silent": True}}}
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+
+    class _Process:
+        async def communicate(self):
+            return stdout, stderr
+
+    _Process.returncode = returncode
+
+    async def _create_subprocess_shell(*_args, **_kwargs):
+        return _Process()
+
+    return runner, run_inbound, _create_subprocess_shell
+
+
+@pytest.mark.asyncio
+async def test_silent_quick_command_suppresses_success_output(monkeypatch):
+    runner, run_inbound, spawn = _silent_runner(0, b"GPT Profile card sent.")
+    monkeypatch.setattr(run_inbound.asyncio, "create_subprocess_shell", spawn)
+
+    assert await runner._handle_message(_make_event("notify")) is None
+
+
+@pytest.mark.asyncio
+async def test_silent_quick_command_still_surfaces_failure(monkeypatch):
+    runner, run_inbound, spawn = _silent_runner(1, b"", b"helper failed")
+    monkeypatch.setattr(run_inbound.asyncio, "create_subprocess_shell", spawn)
+
+    assert await runner._handle_message(_make_event("notify")) == "helper failed"
